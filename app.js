@@ -14,10 +14,14 @@ const CONFIG = {
   adsbBase:   'https://api.adsb.lol/v2',
   adsbdbBase: 'https://api.adsbdb.com/v0',  // route lookups (origin + destination with coords)
   hexdbBase:  'https://hexdb.io/api/v1',    // fallback route lookup
-  // Public CORS proxy. Browser security blocks direct fetch from a github.io
-  // origin to most third-party APIs, so we route through corsproxy.io which
-  // adds the Access-Control-Allow-Origin header for us. Free, no signup.
-  corsProxy:  'https://corsproxy.io/?url=',
+  // Public CORS proxies. We try each in order if direct browser fetch fails.
+  // Multiple options because POST behavior varies between proxies and any
+  // single proxy can rate-limit or go down.
+  corsProxies: [
+    url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+    url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+    url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  ],
   refreshMs:  30_000,                  // re-poll live position every 30s
   storageKey: 'skyward.v2',
   partnerName: 'Norma',
@@ -491,7 +495,11 @@ function formatRelative(secsAgo) {
 }
 function setUpdated(secsAgo) {
   if (secsAgo == null || !isFinite(secsAgo)) { els.lastUpdated.textContent = '—'; return; }
-  els.lastUpdated.textContent = `updated ${formatRelative(secsAgo)}`;
+  // Append the route source (adsb.lol / adsbdb / hexdb) so the user can see
+  // at a glance which database produced the displayed origin & destination.
+  const src = state.currentRoute && state.currentRoute.source;
+  const tag = src ? ` · route: ${src}` : '';
+  els.lastUpdated.textContent = `updated ${formatRelative(secsAgo)}${tag}`;
 }
 function numOrNull(v) { return (typeof v === 'number' && isFinite(v)) ? v : null; }
 
@@ -499,10 +507,9 @@ function numOrNull(v) { return (typeof v === 'number' && isFinite(v)) ? v : null
    API — adsb.lol: live aircraft by callsign
    ───────────────────────────────────────── */
 
-// Wraps fetch through a CORS proxy so static-site requests survive browser
-// same-origin enforcement. Tries direct first (some browsers/extensions may
-// allow it), falls back to the proxy on network failure. Logs everything to
-// the console so issues are diagnosable from devtools.
+// Wraps fetch through CORS proxies so static-site requests survive browser
+// same-origin enforcement. Tries direct first, then walks a chain of public
+// proxies. Logs every attempt so failures are diagnosable from devtools.
 async function corsFetch(targetUrl, options = {}) {
   const init = {
     method:  options.method  || 'GET',
@@ -513,19 +520,33 @@ async function corsFetch(targetUrl, options = {}) {
     init.headers['Content-Type'] = init.headers['Content-Type'] || 'application/json';
   }
 
-  // Attempt direct first — saves a hop when CORS happens to be open.
+  // 1. Try direct (works if the API has open CORS for our origin)
   try {
     const direct = await fetch(targetUrl, init);
     if (direct.ok) return direct;
-    console.warn('[skyward] direct fetch returned', direct.status, 'for', targetUrl, '— retrying via proxy');
+    console.warn('[skyward] direct fetch returned', direct.status, 'for', targetUrl);
   } catch (e) {
-    console.warn('[skyward] direct fetch failed for', targetUrl, '—', e.message, '— retrying via proxy');
+    console.warn('[skyward] direct fetch failed for', targetUrl, '—', e.message);
   }
-  // Fall back through corsproxy.io
-  const proxied = CONFIG.corsProxy + encodeURIComponent(targetUrl);
-  const res = await fetch(proxied, init);
-  if (!res.ok) throw new Error(`proxy ${res.status} for ${targetUrl}`);
-  return res;
+
+  // 2. Walk the proxy chain. Bail out as soon as one succeeds.
+  let lastErr = null;
+  for (const buildProxyUrl of CONFIG.corsProxies) {
+    const proxiedUrl = buildProxyUrl(targetUrl);
+    try {
+      const res = await fetch(proxiedUrl, init);
+      if (res.ok) {
+        console.log('[skyward] proxy hit:', proxiedUrl.split('?')[0]);
+        return res;
+      }
+      lastErr = new Error(`proxy ${res.status}`);
+      console.warn('[skyward] proxy returned', res.status, 'via', proxiedUrl.split('?')[0]);
+    } catch (e) {
+      lastErr = e;
+      console.warn('[skyward] proxy threw', e.message, 'via', proxiedUrl.split('?')[0]);
+    }
+  }
+  throw lastErr || new Error(`all fetch attempts failed for ${targetUrl}`);
 }
 
 /** Returns an array of candidate aircraft (with positions) matching the
@@ -599,37 +620,38 @@ async function fetchRouteByCallsign(callsign, lat = 0, lon = 0) {
   const cs = (callsign || '').trim();
   if (!cs) return null;
 
-  // ── Primary: adsb.lol routeset (matches what adsb.lol's website shows) ──
+  // ── PRIMARY: adsb.lol routeset.
+  // This is the same database adsb.lol's own website uses. Whatever it
+  // returns IS the canonical answer for "what does adsb.lol show for this
+  // flight." We use it unconditionally — even when plausible:false — because
+  // the website also displays it in those cases, and the user is comparing
+  // against the website. The plausible flag is logged for diagnostic purposes
+  // but does NOT gate display.
   try {
     const url  = `${CONFIG.adsbBase.replace(/\/v2$/, '')}/api/0/routeset`;
     const body = JSON.stringify({ planes: [{ callsign: cs, lat, lng: lon }] });
+    console.log('[skyward] querying adsb.lol routeset:', cs, 'pos:', lat?.toFixed?.(2), lon?.toFixed?.(2));
     const res  = await corsFetch(url, { method: 'POST', body });
     const data = await res.json();
+    console.log('[skyward] adsb.lol routeset raw response:', JSON.stringify(data));
     const entry = Array.isArray(data) ? data[0] : null;
     if (entry && Array.isArray(entry._airports) && entry._airports.length >= 2) {
       const origin = entry._airports[0];
       const dest   = entry._airports[entry._airports.length - 1];
-      console.log('[skyward] route via adsb.lol/routeset:',
-                  origin.iata, '→', dest.iata,
-                  '(plausible:', entry.plausible, ')');
-      // adsb.lol explicitly tells us when a route doesn't fit the position.
-      // Trust that signal and reject implausible matches outright.
-      if (entry.plausible === false) {
-        console.warn('[skyward] adsb.lol marked this route as not plausible for the current position; ignoring');
-      } else {
-        return {
-          from: airportFromAdsblol(origin),
-          to:   airportFromAdsblol(dest),
-        };
-      }
-    } else {
-      console.log('[skyward] adsb.lol routeset returned no airport data for', cs);
+      console.log(`[skyward] ✓ route from adsb.lol: ${origin.iata} (${origin.location}) → ${dest.iata} (${dest.location}) [plausible=${entry.plausible}]`);
+      return {
+        from:      airportFromAdsblol(origin),
+        to:        airportFromAdsblol(dest),
+        source:    'adsb.lol',
+        plausible: entry.plausible !== false,
+      };
     }
+    console.log('[skyward] adsb.lol returned no airport data — trying fallbacks');
   } catch (e) {
-    console.warn('[skyward] adsb.lol routeset lookup failed:', e.message);
+    console.warn('[skyward] adsb.lol routeset failed:', e.message, '— trying fallbacks');
   }
 
-  // ── Fallback 1: adsbdb.com ──
+  // ── FALLBACK 1: adsbdb.com (when adsb.lol returns nothing) ──
   try {
     const url  = `${CONFIG.adsbdbBase}/callsign/${encodeURIComponent(cs)}`;
     const res  = await corsFetch(url);
@@ -638,18 +660,18 @@ async function fetchRouteByCallsign(callsign, lat = 0, lon = 0) {
     if (fr && fr.origin && fr.destination &&
         typeof fr.origin.latitude === 'number' && typeof fr.origin.longitude === 'number' &&
         typeof fr.destination.latitude === 'number' && typeof fr.destination.longitude === 'number') {
-      console.log('[skyward] route via adsbdb (fallback):',
-                  fr.origin.iata_code, '→', fr.destination.iata_code);
+      console.log(`[skyward] ✓ route from adsbdb (fallback): ${fr.origin.iata_code} (${fr.origin.municipality}) → ${fr.destination.iata_code} (${fr.destination.municipality})`);
       return {
-        from: airportFromAdsbdb(fr.origin),
-        to:   airportFromAdsbdb(fr.destination),
+        from:   airportFromAdsbdb(fr.origin),
+        to:     airportFromAdsbdb(fr.destination),
+        source: 'adsbdb',
       };
     }
   } catch (e) {
     console.warn('[skyward] adsbdb route lookup failed:', e.message);
   }
 
-  // ── Fallback 2: hexdb.io ──
+  // ── FALLBACK 2: hexdb.io (last resort) ──
   try {
     const url  = `${CONFIG.hexdbBase}/route/icao/${encodeURIComponent(cs)}`;
     const res  = await corsFetch(url);
@@ -660,8 +682,12 @@ async function fetchRouteByCallsign(callsign, lat = 0, lon = 0) {
         const fromAp = AIRPORTS[parts[0]];
         const toAp   = AIRPORTS[parts[parts.length - 1]];
         if (fromAp && toAp) {
-          console.log('[skyward] route via hexdb (fallback):', fromAp.iata, '→', toAp.iata);
-          return { from: { ...fromAp, icao: parts[0] }, to: { ...toAp, icao: parts[parts.length - 1] } };
+          console.log(`[skyward] ✓ route from hexdb (last-resort fallback): ${fromAp.iata} → ${toAp.iata}`);
+          return {
+            from:   { ...fromAp, icao: parts[0] },
+            to:     { ...toAp,   icao: parts[parts.length - 1] },
+            source: 'hexdb',
+          };
         }
       }
     }
@@ -669,7 +695,7 @@ async function fetchRouteByCallsign(callsign, lat = 0, lon = 0) {
     console.warn('[skyward] hexdb route lookup failed:', e.message);
   }
 
-  console.warn('[skyward] no route data found for', cs);
+  console.warn('[skyward] no route data available for', cs, 'from any source');
   return null;
 }
 
@@ -1003,26 +1029,26 @@ async function trackFlight(rawInput) {
   // to feed into the route lookup so adsb.lol can plausibility-check.
   let aircraft = pickBestAircraft(aircraftList, null);
 
-  // Step 3: look up the route. adsb.lol's /api/0/routeset endpoint takes the
-  // plane's current lat/lng and returns the SAME route data shown on adsb.lol's
-  // own website, with a `plausible` flag we trust.
+  // Step 3: look up the route. adsb.lol's /api/0/routeset is the canonical
+  // source and matches what the adsb.lol website shows. Whatever it returns,
+  // we trust — even if `plausible:false` — because the website behaves the
+  // same way and the user is comparing against the website.
   const lookupCallsign = (aircraft.flight || usedCallsign || '').trim();
   const route = await fetchRouteByCallsign(lookupCallsign, aircraft.lat, aircraft.lon);
 
-  // Step 4: now that we have a route, re-pick to get the candidate that best
-  // matches it (relevant only when multiple aircraft share the callsign).
+  // Step 4: when multiple aircraft share a callsign, re-pick using the route
+  // to get the best-fit one. (No-op if list has just one.)
   if (route && aircraftList.length > 1) {
     aircraft = pickBestAircraft(aircraftList, route);
   }
 
-  // Step 5: final validation. If even the best-fit aircraft is wildly off
-  // the route, drop the route rather than draw a misleading line.
+  // Step 5: validation. ONLY validate fallback sources (adsbdb / hexdb) with
+  // position scoring — adsb.lol is canonical and is shown unconditionally.
   let confirmedRoute = route;
-  if (route) {
+  if (route && route.source && route.source !== 'adsb.lol') {
     const score = scoreRouteConsistency(aircraft, route);
     if (score < 30) {
-      console.warn('[skyward] aircraft score', score.toFixed(1),
-                   '— route data inconsistent with actual position; suppressing route');
+      console.warn(`[skyward] fallback route from ${route.source} scored ${score.toFixed(1)} — suppressing as inconsistent with position`);
       confirmedRoute = null;
     }
   }
