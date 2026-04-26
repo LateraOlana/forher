@@ -503,10 +503,19 @@ function numOrNull(v) { return (typeof v === 'number' && isFinite(v)) ? v : null
 // same-origin enforcement. Tries direct first (some browsers/extensions may
 // allow it), falls back to the proxy on network failure. Logs everything to
 // the console so issues are diagnosable from devtools.
-async function corsFetch(targetUrl) {
+async function corsFetch(targetUrl, options = {}) {
+  const init = {
+    method:  options.method  || 'GET',
+    headers: { 'Accept': 'application/json', ...(options.headers || {}) },
+  };
+  if (options.body !== undefined) {
+    init.body = options.body;
+    init.headers['Content-Type'] = init.headers['Content-Type'] || 'application/json';
+  }
+
   // Attempt direct first — saves a hop when CORS happens to be open.
   try {
-    const direct = await fetch(targetUrl, { headers: { 'Accept': 'application/json' } });
+    const direct = await fetch(targetUrl, init);
     if (direct.ok) return direct;
     console.warn('[skyward] direct fetch returned', direct.status, 'for', targetUrl, '— retrying via proxy');
   } catch (e) {
@@ -514,7 +523,7 @@ async function corsFetch(targetUrl) {
   }
   // Fall back through corsproxy.io
   const proxied = CONFIG.corsProxy + encodeURIComponent(targetUrl);
-  const res = await fetch(proxied, { headers: { 'Accept': 'application/json' } });
+  const res = await fetch(proxied, init);
   if (!res.ok) throw new Error(`proxy ${res.status} for ${targetUrl}`);
   return res;
 }
@@ -578,25 +587,59 @@ function pickBestAircraft(list, route) {
 
 /* ─────────────────────────────────────────
    API — route lookup
-   Tries adsbdb.com first (returns full airport details with coordinates),
-   falls back to hexdb.io (returns just ICAO codes — looked up in our table).
-   Either way, returns { from: {iata, icao, city, name, country, lat, lon},
-                          to:   {iata, icao, city, name, country, lat, lon} } or null.
+   Primary: adsb.lol's own /api/0/routeset endpoint. This is the SAME source
+   adsb.lol's own website uses, so origin/destination will match what the
+   user sees there. It accepts the plane's current location and returns a
+   `plausible` boolean that flags route data that doesn't fit the actual
+   aircraft position — letting us reject stale matches before drawing them.
+   Fallbacks: adsbdb.com, then hexdb.io.
+   Returns { from, to } airport pair or null.
    ───────────────────────────────────────── */
-async function fetchRouteByCallsign(callsign) {
+async function fetchRouteByCallsign(callsign, lat = 0, lon = 0) {
   const cs = (callsign || '').trim();
   if (!cs) return null;
 
-  // Try adsbdb.com — best source: gives airport name + city + lat/lon directly
+  // ── Primary: adsb.lol routeset (matches what adsb.lol's website shows) ──
   try {
-    const url = `${CONFIG.adsbdbBase}/callsign/${encodeURIComponent(cs)}`;
-    const res = await corsFetch(url);
+    const url  = `${CONFIG.adsbBase.replace(/\/v2$/, '')}/api/0/routeset`;
+    const body = JSON.stringify({ planes: [{ callsign: cs, lat, lng: lon }] });
+    const res  = await corsFetch(url, { method: 'POST', body });
     const data = await res.json();
-    const fr = data && data.response && data.response.flightroute;
+    const entry = Array.isArray(data) ? data[0] : null;
+    if (entry && Array.isArray(entry._airports) && entry._airports.length >= 2) {
+      const origin = entry._airports[0];
+      const dest   = entry._airports[entry._airports.length - 1];
+      console.log('[skyward] route via adsb.lol/routeset:',
+                  origin.iata, '→', dest.iata,
+                  '(plausible:', entry.plausible, ')');
+      // adsb.lol explicitly tells us when a route doesn't fit the position.
+      // Trust that signal and reject implausible matches outright.
+      if (entry.plausible === false) {
+        console.warn('[skyward] adsb.lol marked this route as not plausible for the current position; ignoring');
+      } else {
+        return {
+          from: airportFromAdsblol(origin),
+          to:   airportFromAdsblol(dest),
+        };
+      }
+    } else {
+      console.log('[skyward] adsb.lol routeset returned no airport data for', cs);
+    }
+  } catch (e) {
+    console.warn('[skyward] adsb.lol routeset lookup failed:', e.message);
+  }
+
+  // ── Fallback 1: adsbdb.com ──
+  try {
+    const url  = `${CONFIG.adsbdbBase}/callsign/${encodeURIComponent(cs)}`;
+    const res  = await corsFetch(url);
+    const data = await res.json();
+    const fr   = data && data.response && data.response.flightroute;
     if (fr && fr.origin && fr.destination &&
         typeof fr.origin.latitude === 'number' && typeof fr.origin.longitude === 'number' &&
         typeof fr.destination.latitude === 'number' && typeof fr.destination.longitude === 'number') {
-      console.log('[skyward] route via adsbdb:', fr.origin.iata_code, '→', fr.destination.iata_code);
+      console.log('[skyward] route via adsbdb (fallback):',
+                  fr.origin.iata_code, '→', fr.destination.iata_code);
       return {
         from: airportFromAdsbdb(fr.origin),
         to:   airportFromAdsbdb(fr.destination),
@@ -606,10 +649,10 @@ async function fetchRouteByCallsign(callsign) {
     console.warn('[skyward] adsbdb route lookup failed:', e.message);
   }
 
-  // Fallback to hexdb.io — returns "ICAO1-ICAO2", look up in our airport table
+  // ── Fallback 2: hexdb.io ──
   try {
-    const url = `${CONFIG.hexdbBase}/route/icao/${encodeURIComponent(cs)}`;
-    const res = await corsFetch(url);
+    const url  = `${CONFIG.hexdbBase}/route/icao/${encodeURIComponent(cs)}`;
+    const res  = await corsFetch(url);
     const data = await res.json();
     if (data && data.route) {
       const parts = String(data.route).split('-').map(s => s.trim()).filter(Boolean);
@@ -617,11 +660,9 @@ async function fetchRouteByCallsign(callsign) {
         const fromAp = AIRPORTS[parts[0]];
         const toAp   = AIRPORTS[parts[parts.length - 1]];
         if (fromAp && toAp) {
-          console.log('[skyward] route via hexdb:', fromAp.iata, '→', toAp.iata);
+          console.log('[skyward] route via hexdb (fallback):', fromAp.iata, '→', toAp.iata);
           return { from: { ...fromAp, icao: parts[0] }, to: { ...toAp, icao: parts[parts.length - 1] } };
         }
-        console.warn('[skyward] hexdb returned route', parts.join('-'),
-                     'but airport(s) missing from local table');
       }
     }
   } catch (e) {
@@ -630,6 +671,19 @@ async function fetchRouteByCallsign(callsign) {
 
   console.warn('[skyward] no route data found for', cs);
   return null;
+}
+
+// Normalize an adsb.lol routeset airport entry into our standard airport shape
+function airportFromAdsblol(a) {
+  return {
+    iata:    a.iata    || '',
+    icao:    a.icao    || '',
+    name:    a.name    || '',
+    city:    a.location|| a.name || '',
+    country: a.countryiso2 || '',
+    lat:     a.lat,
+    lon:     a.lon,
+  };
 }
 
 // Normalize an adsbdb origin/destination object into our standard airport shape
@@ -944,16 +998,25 @@ async function trackFlight(rawInput) {
     return;
   }
 
-  // Step 2: look up the route by the same callsign that hit on adsb.lol.
-  const route = await fetchRouteByCallsign(usedCallsign);
+  // Step 2: pick a probable aircraft from the candidates. With no route info
+  // yet this is just "first exact callsign match," but it gives us a position
+  // to feed into the route lookup so adsb.lol can plausibility-check.
+  let aircraft = pickBestAircraft(aircraftList, null);
 
-  // Step 3: pick the aircraft whose position + heading best fit that route.
-  // (Multiple planes can share a callsign; route-based scoring disambiguates.)
-  let aircraft = pickBestAircraft(aircraftList, route);
+  // Step 3: look up the route. adsb.lol's /api/0/routeset endpoint takes the
+  // plane's current lat/lng and returns the SAME route data shown on adsb.lol's
+  // own website, with a `plausible` flag we trust.
+  const lookupCallsign = (aircraft.flight || usedCallsign || '').trim();
+  const route = await fetchRouteByCallsign(lookupCallsign, aircraft.lat, aircraft.lon);
 
-  // Step 4: validate. If the best-fit aircraft is wildly inconsistent with
-  // the route, the route data is probably stale or wrong — drop it and just
-  // show live position rather than draw a misleading line on the map.
+  // Step 4: now that we have a route, re-pick to get the candidate that best
+  // matches it (relevant only when multiple aircraft share the callsign).
+  if (route && aircraftList.length > 1) {
+    aircraft = pickBestAircraft(aircraftList, route);
+  }
+
+  // Step 5: final validation. If even the best-fit aircraft is wildly off
+  // the route, drop the route rather than draw a misleading line.
   let confirmedRoute = route;
   if (route) {
     const score = scoreRouteConsistency(aircraft, route);
