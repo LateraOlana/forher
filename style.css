@@ -511,6 +511,48 @@ body {
   50%      { transform: scale(1.18); }
 }
 
+/* Permanent labels next to departure & arrival airports */
+.airport-label {
+  background: rgba(11, 17, 38, 0.92) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 12px !important;
+  padding: 8px 12px !important;
+  color: var(--paper) !important;
+  font-family: var(--sans) !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5) !important;
+  backdrop-filter: blur(10px);
+  white-space: nowrap;
+}
+.airport-label::before { display: none !important; } /* hide tooltip arrow */
+.airport-label-headline {
+  font-size: 9px;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
+  color: var(--paper-mute);
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+.airport-label-code {
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 22px;
+  line-height: 1;
+  letter-spacing: 1px;
+}
+.airport-label-from .airport-label-code { color: var(--sky); }
+.airport-label-to   .airport-label-code { color: var(--coral); }
+.airport-label-city {
+  font-size: 11px;
+  color: var(--paper-faint);
+  margin-top: 2px;
+}
+.airport-label-time {
+  font-size: 11px;
+  color: var(--gold);
+  margin-top: 4px;
+  letter-spacing: 0.3px;
+}
+
 .plane-marker {
   width: 36px; height: 36px;
   display: flex; align-items: center; justify-content: center;

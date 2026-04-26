@@ -12,7 +12,8 @@
    ───────────────────────────────────────── */
 const CONFIG = {
   adsbBase:   'https://api.adsb.lol/v2',
-  hexdbBase:  'https://hexdb.io/api/v1',
+  adsbdbBase: 'https://api.adsbdb.com/v0',  // route lookups (origin + destination with coords)
+  hexdbBase:  'https://hexdb.io/api/v1',    // fallback route lookup
   // Public CORS proxy. Browser security blocks direct fetch from a github.io
   // origin to most third-party APIs, so we route through corsproxy.io which
   // adds the Access-Control-Allow-Origin header for us. Free, no signup.
@@ -506,23 +507,72 @@ async function fetchAircraftByCallsign(callsign) {
 }
 
 /* ─────────────────────────────────────────
-   API — hexdb.io: route by callsign
+   API — route lookup
+   Tries adsbdb.com first (returns full airport details with coordinates),
+   falls back to hexdb.io (returns just ICAO codes — looked up in our table).
+   Either way, returns { from: {iata, icao, city, name, country, lat, lon},
+                          to:   {iata, icao, city, name, country, lat, lon} } or null.
    ───────────────────────────────────────── */
 async function fetchRouteByCallsign(callsign) {
+  const cs = (callsign || '').trim();
+  if (!cs) return null;
+
+  // Try adsbdb.com — best source: gives airport name + city + lat/lon directly
   try {
-    const cs = (callsign || '').trim();
-    if (!cs) return null;
+    const url = `${CONFIG.adsbdbBase}/callsign/${encodeURIComponent(cs)}`;
+    const res = await corsFetch(url);
+    const data = await res.json();
+    const fr = data && data.response && data.response.flightroute;
+    if (fr && fr.origin && fr.destination &&
+        typeof fr.origin.latitude === 'number' && typeof fr.origin.longitude === 'number' &&
+        typeof fr.destination.latitude === 'number' && typeof fr.destination.longitude === 'number') {
+      console.log('[skyward] route via adsbdb:', fr.origin.iata_code, '→', fr.destination.iata_code);
+      return {
+        from: airportFromAdsbdb(fr.origin),
+        to:   airportFromAdsbdb(fr.destination),
+      };
+    }
+  } catch (e) {
+    console.warn('[skyward] adsbdb route lookup failed:', e.message);
+  }
+
+  // Fallback to hexdb.io — returns "ICAO1-ICAO2", look up in our airport table
+  try {
     const url = `${CONFIG.hexdbBase}/route/icao/${encodeURIComponent(cs)}`;
     const res = await corsFetch(url);
     const data = await res.json();
-    if (!data || !data.route) return null;
-    const parts = String(data.route).split('-').map(s => s.trim()).filter(Boolean);
-    if (parts.length < 2) return null;
-    return { fromIcao: parts[0], toIcao: parts[parts.length - 1] };
+    if (data && data.route) {
+      const parts = String(data.route).split('-').map(s => s.trim()).filter(Boolean);
+      if (parts.length >= 2) {
+        const fromAp = AIRPORTS[parts[0]];
+        const toAp   = AIRPORTS[parts[parts.length - 1]];
+        if (fromAp && toAp) {
+          console.log('[skyward] route via hexdb:', fromAp.iata, '→', toAp.iata);
+          return { from: { ...fromAp, icao: parts[0] }, to: { ...toAp, icao: parts[parts.length - 1] } };
+        }
+        console.warn('[skyward] hexdb returned route', parts.join('-'),
+                     'but airport(s) missing from local table');
+      }
+    }
   } catch (e) {
-    console.warn('[skyward] route lookup failed:', e.message);
-    return null;
+    console.warn('[skyward] hexdb route lookup failed:', e.message);
   }
+
+  console.warn('[skyward] no route data found for', cs);
+  return null;
+}
+
+// Normalize an adsbdb origin/destination object into our standard airport shape
+function airportFromAdsbdb(a) {
+  return {
+    iata:    a.iata_code || '',
+    icao:    a.icao_code || '',
+    name:    a.name || '',
+    city:    a.municipality || a.name || '',
+    country: a.country_iso_name || a.country_name || '',
+    lat:     a.latitude,
+    lon:     a.longitude,
+  };
 }
 
 /* ─────────────────────────────────────────
@@ -577,20 +627,55 @@ function planeIcon(headingDeg) {
 /* ─────────────────────────────────────────
    Render: route, plane, stats
    ───────────────────────────────────────── */
-function renderRoute(from, to) {
+function renderRoute(from, to, timing) {
   const path = greatCirclePath(from.lat, from.lon, to.lat, to.lon, 128);
   state.routeLayer = L.polyline(path, {
     color: '#e9b872', weight: 2, opacity: 0.55,
     dashArray: '6, 8', lineCap: 'round',
   }).addTo(state.map);
 
+  // Permanent, always-visible labels for departure & arrival airports
+  const departTime = (timing && timing.departText) ? timing.departText : '';
+  const arriveTime = (timing && timing.arriveText) ? timing.arriveText : '';
+
   state.fromMarker = L.marker([from.lat, from.lon], { icon: airportIcon('from') })
-    .bindTooltip(`${from.iata} · ${from.city}`, { direction: 'top', offset: [0, -10] })
+    .bindTooltip(buildAirportLabel('Departed', from, departTime), {
+      permanent: true, direction: 'right', offset: [12, 0],
+      className: 'airport-label airport-label-from',
+    })
     .addTo(state.map);
 
   state.toMarker = L.marker([to.lat, to.lon], { icon: airportIcon('to') })
-    .bindTooltip(`${to.iata} · ${to.city}`, { direction: 'top', offset: [0, -10] })
+    .bindTooltip(buildAirportLabel('Arriving', to, arriveTime), {
+      permanent: true, direction: 'left', offset: [-12, 0],
+      className: 'airport-label airport-label-to',
+    })
     .addTo(state.map);
+}
+
+function buildAirportLabel(headline, ap, time) {
+  // headline: "Departed" or "Arriving"; ap: airport object; time: HH:MM string or ''
+  const code = (ap.iata || ap.icao || '???').toUpperCase();
+  const place = ap.city || ap.name || '';
+  const timeRow = time ? `<div class="airport-label-time">${headline.toLowerCase()} ${time}</div>` : '';
+  return `
+    <div class="airport-label-headline">${headline}</div>
+    <div class="airport-label-code">${code}</div>
+    <div class="airport-label-city">${place}</div>
+    ${timeRow}
+  `;
+}
+
+// Update the permanent labels in place when timing changes (called on each refresh)
+function updateRouteLabels(from, to, timing) {
+  if (state.fromMarker) {
+    const t = (timing && timing.departText) ? timing.departText : '';
+    state.fromMarker.setTooltipContent(buildAirportLabel('Departed', from, t));
+  }
+  if (state.toMarker) {
+    const t = (timing && timing.arriveText) ? timing.arriveText : '';
+    state.toMarker.setTooltipContent(buildAirportLabel('Arriving', to, t));
+  }
 }
 
 function renderFlownPath(from, currentLat, currentLon) {
@@ -621,6 +706,32 @@ function fitMapToFlight(from, to, planeLat, planeLon) {
   else if (points.length > 1) state.map.fitBounds(points, { padding: [60, 60], maxZoom: 7 });
 }
 
+/** Estimate departure & arrival times from current speed and progress.
+ *  Returns { departText, arriveText, remainingHuman } — all may be ''
+ *  if speed is too low to make a meaningful estimate. */
+function computeTiming(speedKt, flownKm, remainingKm) {
+  const out = { departText: '', arriveText: '', remainingHuman: '' };
+  // Need a real cruising speed to make any estimate
+  if (!speedKt || speedKt < 100) return out;
+
+  const speedKmh = speedKt * 1.852;
+  const remainingHours = remainingKm / speedKmh;
+  const elapsedHours   = flownKm / speedKmh;
+
+  const now = Date.now();
+  const arriveAt = new Date(now + remainingHours * 3600 * 1000);
+  const departAt = new Date(now - elapsedHours   * 3600 * 1000);
+
+  const fmt = d => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  out.arriveText = fmt(arriveAt);
+  out.departText = fmt(departAt);
+
+  const h = Math.floor(remainingHours);
+  const m = Math.round((remainingHours - h) * 60);
+  out.remainingHuman = h > 0 ? `${h}h ${m}m` : `${m}m`;
+  return out;
+}
+
 /** ac is an adsb.lol aircraft object. */
 function renderStats(ac, route) {
   const altFt    = numOrNull(ac.alt_geom) ?? numOrNull(ac.alt_baro);
@@ -641,10 +752,10 @@ function renderStats(ac, route) {
     ? `${route.from.city} ${route.from.iata}` : '—';
 
   if (route && route.from && route.to && lat != null && lon != null) {
-    els.fromAirport.textContent = `${route.from.city} ${route.from.iata}`;
-    els.toAirport.textContent   = `${route.to.city} ${route.to.iata}`;
-    els.progressFromCode.textContent = route.from.iata;
-    els.progressToCode.textContent   = route.to.iata;
+    els.fromAirport.textContent = `${route.from.city} ${route.from.iata}`.trim();
+    els.toAirport.textContent   = `${route.to.city} ${route.to.iata}`.trim();
+    els.progressFromCode.textContent = route.from.iata || route.from.icao || '—';
+    els.progressToCode.textContent   = route.to.iata   || route.to.icao   || '—';
 
     const totalKm     = haversineKm(route.from.lat, route.from.lon, route.to.lat, route.to.lon);
     const flownKm     = haversineKm(route.from.lat, route.from.lon, lat, lon);
@@ -657,19 +768,20 @@ function renderStats(ac, route) {
     els.distFlown.textContent     = `${formatKm(flownKm)} flown`;
     els.distRemaining.textContent = `${formatKm(remainingKm)} to go`;
 
-    if (speedKt && speedKt > 100) {
-      const speedKmh = speedKt * 1.852;
-      const remainingHours = remainingKm / speedKmh;
-      const arrivalDate = new Date(Date.now() + remainingHours * 3600 * 1000);
-      const hh = arrivalDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      const hours = Math.floor(remainingHours);
-      const mins  = Math.round((remainingHours - hours) * 60);
-      els.etaValue.textContent = hh;
-      els.etaSub.textContent   = `~${hours}h ${mins}m left · landing in ${route.to.city}`;
+    // Compute departure & arrival times (best-effort, based on speed + progress)
+    const timing = computeTiming(speedKt, flownKm, remainingKm);
+
+    if (timing.arriveText) {
+      els.etaValue.textContent = timing.arriveText;
+      const departLine = timing.departText ? `departed ${timing.departText} · ` : '';
+      els.etaSub.textContent   = `${departLine}~${timing.remainingHuman} left · landing in ${route.to.city}`;
     } else {
       els.etaValue.textContent = '—';
       els.etaSub.textContent   = `landing in ${route.to.city}`;
     }
+
+    // Push timing into the permanent map labels so they stay in sync as the flight progresses
+    updateRouteLabels(route.from, route.to, timing);
 
     els.loveNoteText.textContent = makeLoveNote({ altFt, route, flownKm, remainingKm, pct });
   } else {
@@ -762,14 +874,8 @@ async function trackFlight(rawInput) {
   setTimeout(() => state.map.invalidateSize(), 50);
   clearMapLayers();
 
-  // Try route lookup
-  let route = null;
-  const r = await fetchRouteByCallsign(state.currentCallsign || usedCallsign);
-  if (r) {
-    const fromAp = AIRPORTS[r.fromIcao];
-    const toAp   = AIRPORTS[r.toIcao];
-    if (fromAp && toAp) route = { from: fromAp, to: toAp };
-  }
+  // Try route lookup — adsbdb returns full airport objects, hexdb falls back through our table
+  const route = await fetchRouteByCallsign(state.currentCallsign || usedCallsign);
   state.currentRoute = route;
 
   if (state.currentRoute) {
