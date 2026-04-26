@@ -169,6 +169,28 @@ body {
   box-shadow: 0 0 10px var(--gold);
 }
 
+.header-tag {
+  display: inline-flex; align-items: center;
+  padding: 8px 16px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(233, 184, 114, 0.06);
+  color: var(--gold);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  backdrop-filter: blur(10px);
+}
+.header-tag::before {
+  content: ''; display: inline-block;
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--gold);
+  box-shadow: 0 0 10px var(--gold);
+  margin-right: 10px;
+  animation: pulse-dot 2.4s ease-in-out infinite;
+}
+
 .primary-btn {
   display: inline-flex; align-items: center; gap: 8px;
   padding: 12px 22px;
@@ -197,11 +219,13 @@ body {
 
 .hero-plane {
   position: absolute;
+  pointer-events: none;
   width: 140px; height: 42px;
   color: rgba(243, 236, 224, 0.18);
   top: 8%; left: -180px;
   filter: drop-shadow(0 0 30px rgba(233, 184, 114, 0.25));
   animation: hero-fly 22s linear infinite;
+  z-index: 0;
 }
 @keyframes hero-fly {
   0%   { left: -180px; top: 12%; transform: rotate(-2deg); }

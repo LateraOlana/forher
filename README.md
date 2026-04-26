@@ -28,20 +28,24 @@ You can also just open `index.html` directly in a browser to try it locally.
 1. Type a flight number like `BA286`, `AA100`, `LH441`, `EK215`, or `QF8`.
 2. Hit **Track flight**.
 3. Watch the route draw itself across the map, with the plane's live position pulsing along the path.
-4. Tap the little heart button in the corner to personalize the headline with her name and a pet name — it saves to your browser so it's there next time.
 
 The map auto-refreshes every 30 seconds while a flight is in the air.
 
 ## How it works
 
-Skyward uses the wonderful (and free) [OpenSky Network](https://opensky-network.org/) public API to get live aircraft positions. It matches your flight number to an active aircraft by callsign, then draws:
+Skyward uses two free, no-key APIs:
+
+- **[adsb.lol](https://adsb.lol/)** for live aircraft positions (community-fed ADS-B network, drop-in compatible with the ADSBexchange API)
+- **[hexdb.io](https://hexdb.io/)** for callsign → origin/destination route lookups
+
+It matches your flight number to an active aircraft by callsign, then draws:
 
 - A great-circle route line between origin and destination
 - A solid trail showing how far they've already flown
 - A pulsing little plane icon at their current position, rotated to their heading
 - Live altitude, speed, heading, and a progress bar with ETA
 
-If the flight isn't currently airborne, you'll get a friendly note. OpenSky only sees flights that are actively transmitting ADS-B, so very short hops or some regional flights may not appear.
+If the flight isn't currently airborne, you'll get a friendly note. ADS-B networks only see flights that are actively transmitting, so very short hops or some regional flights may not appear.
 
 ## Customizing
 
@@ -54,9 +58,10 @@ Colors and animation timing live as CSS variables at the top of `style.css`. Twe
 
 ## Credits
 
-- Flight data — [OpenSky Network](https://opensky-network.org/)
+- Live aircraft data — [ADSB.lol](https://adsb.lol/)
+- Route data — [hexdb.io](https://hexdb.io/)
 - Map tiles — [CARTO](https://carto.com/) on [OpenStreetMap](https://www.openstreetmap.org/)
 - Map library — [Leaflet](https://leafletjs.com/)
 - Fonts — Instrument Serif & Manrope, via Google Fonts
 
-Made with care. Safe travels to her. 💛
+Made with care. Safe travels, Norma. 💛

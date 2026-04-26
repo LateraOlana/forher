@@ -37,9 +37,7 @@
       <span class="brand-name">Skyward</span>
     </a>
     <nav class="header-nav">
-      <button id="personalizeBtn" class="ghost-btn" type="button">
-        <span class="dot"></span> Personalize
-      </button>
+      <span class="header-tag">For Norma</span>
     </nav>
   </header>
 
@@ -54,7 +52,7 @@
     <p class="eyebrow"><span></span> Live flight tracker</p>
     <h1 class="hero-title">
       Where in the world
-      <em>is <span id="heroName">she</span>?</em>
+      <em>is <span id="heroName">Norma</span>?</em>
     </h1>
     <p class="hero-sub">
       Type a flight number. Watch her star travel across the sky in real time.
@@ -195,31 +193,10 @@
     <button class="ghost-btn" type="button" onclick="document.getElementById('flightInput').focus()">Try again</button>
   </section>
 
-  <!-- ───────── Personalize Modal ───────── -->
-  <div class="modal-backdrop" id="modal" hidden>
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
-      <button class="modal-close" id="modalClose" aria-label="Close">×</button>
-      <h2 id="modalTitle">Make it yours</h2>
-      <p class="modal-sub">A small touch — her name shows up in the headline and little notes.</p>
-      <label class="field">
-        <span>Her name</span>
-        <input id="nameInput" type="text" placeholder="e.g. Ana" maxlength="24" />
-      </label>
-      <label class="field">
-        <span>Pet name (optional)</span>
-        <input id="petInput" type="text" placeholder="e.g. love, sunshine" maxlength="24" />
-      </label>
-      <div class="modal-actions">
-        <button class="ghost-btn" id="modalCancel" type="button">Cancel</button>
-        <button class="primary-btn" id="modalSave" type="button">Save</button>
-      </div>
-    </div>
-  </div>
-
   <!-- ───────── Footer ───────── -->
   <footer class="site-footer">
-    <p>Built with care · Live data from <a href="https://opensky-network.org/" target="_blank" rel="noopener">OpenSky Network</a> · Maps © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a></p>
-    <p class="footer-quiet">Safe travels. Always.</p>
+    <p>Built with care · Live data from <a href="https://adsb.lol/" target="_blank" rel="noopener">ADSB.lol</a> · Routes from <a href="https://hexdb.io/" target="_blank" rel="noopener">hexdb.io</a> · Maps © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a></p>
+    <p class="footer-quiet">Safe travels, Norma. Always.</p>
   </footer>
 
   <!-- Leaflet JS -->

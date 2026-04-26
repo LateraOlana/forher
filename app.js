@@ -1,7 +1,8 @@
 /* =====================================================================
-   Skyward · live flight tracker
-   Data: OpenSky Network public API (no auth required)
-   Map: Leaflet + CartoDB dark tiles
+   Skyward · live flight tracker (for Norma 💛)
+   Live data:  adsb.lol      — https://api.adsb.lol/v2/callsign/{cs}
+   Routes:     hexdb.io      — https://hexdb.io/api/v1/route/icao/{cs}
+   Map:        Leaflet + CartoDB dark tiles
    ===================================================================== */
 
 'use strict';
@@ -10,15 +11,15 @@
    Config
    ───────────────────────────────────────── */
 const CONFIG = {
-  apiBase: 'https://opensky-network.org/api',
-  refreshMs: 30_000,                 // re-poll live position every 30s
-  flightHistoryWindowSec: 4 * 3600,  // search ±4h around now for route data
-  storageKey: 'skyward.v1',
+  adsbBase:   'https://api.adsb.lol/v2',
+  hexdbBase:  'https://hexdb.io/api/v1',
+  refreshMs:  30_000,                  // re-poll live position every 30s
+  storageKey: 'skyward.v2',
+  partnerName: 'Norma',
 };
 
 /* ─────────────────────────────────────────
    IATA → ICAO airline codes
-   (covers ~85 airlines — easy to extend)
    ───────────────────────────────────────── */
 const AIRLINES = {
   AA:'AAL',AC:'ACA',AF:'AFR',AI:'AIC',AM:'AMX',AR:'ARG',AS:'ASA',AY:'FIN',AZ:'ITY',
@@ -49,8 +50,6 @@ const AIRLINES = {
 
 /* ─────────────────────────────────────────
    Major-airport database (ICAO → details)
-   ~210 airports, covers most international flights.
-   Each entry also stores its IATA code for display.
    ───────────────────────────────────────── */
 const AIRPORTS = {
   // ─── United States ───
@@ -305,17 +304,15 @@ const AIRPORTS = {
    ───────────────────────────────────────── */
 const state = {
   map: null,
-  routeLayer: null,           // L.Polyline of full route
-  flownLayer: null,           // L.Polyline of distance flown so far
+  routeLayer: null,
+  flownLayer: null,
   fromMarker: null,
   toMarker: null,
   planeMarker: null,
   refreshTimer: null,
   currentCallsign: null,
   currentIcao24: null,
-  currentRoute: null,         // { from: airport, to: airport }
-  partnerName: 'her',
-  petName: '',
+  currentRoute: null,
   recent: [],
 };
 
@@ -324,68 +321,53 @@ const state = {
    ───────────────────────────────────────── */
 const $ = (sel) => document.querySelector(sel);
 const els = {
-  form:      $('#searchForm'),
-  input:     $('#flightInput'),
-  hero:      $('#hero'),
-  tracker:   $('#tracker'),
-  loading:   $('#loadingState'),
-  error:     $('#errorState'),
-  errorTitle:$('#errorTitle'),
-  errorSub:  $('#errorSub'),
-  recent:    $('#recent'),
-  recentChips: $('#recentChips'),
-  callsignBadge: $('#callsignBadge'),
-  fromAirport: $('#fromAirport'),
-  toAirport:   $('#toAirport'),
-  lastUpdated: $('#lastUpdated'),
-  refreshBtn:  $('#refreshBtn'),
-  statAltitude:$('#statAltitude'),
-  statSpeed:   $('#statSpeed'),
-  statHeading: $('#statHeading'),
-  statOrigin:  $('#statOrigin'),
-  loveNote:    $('#loveNote'),
-  loveNoteText:$('#loveNoteText'),
-  progressFill:$('#progressFill'),
-  progressPlane:$('#progressPlane'),
+  form:            $('#searchForm'),
+  input:           $('#flightInput'),
+  hero:            $('#hero'),
+  tracker:         $('#tracker'),
+  loading:         $('#loadingState'),
+  error:           $('#errorState'),
+  errorTitle:      $('#errorTitle'),
+  errorSub:        $('#errorSub'),
+  recent:          $('#recent'),
+  recentChips:     $('#recentChips'),
+  callsignBadge:   $('#callsignBadge'),
+  fromAirport:     $('#fromAirport'),
+  toAirport:       $('#toAirport'),
+  lastUpdated:     $('#lastUpdated'),
+  refreshBtn:      $('#refreshBtn'),
+  statAltitude:    $('#statAltitude'),
+  statSpeed:       $('#statSpeed'),
+  statHeading:     $('#statHeading'),
+  statOrigin:      $('#statOrigin'),
+  loveNote:        $('#loveNote'),
+  loveNoteText:    $('#loveNoteText'),
+  progressFill:    $('#progressFill'),
+  progressPlane:   $('#progressPlane'),
   progressPercent: $('#progressPercent'),
   progressFromCode:$('#progressFromCode'),
   progressToCode:  $('#progressToCode'),
-  distFlown:    $('#distFlown'),
-  distRemaining:$('#distRemaining'),
-  etaValue:     $('#etaValue'),
-  etaSub:       $('#etaSub'),
-  heroName:     $('#heroName'),
-  // modal
-  personalizeBtn: $('#personalizeBtn'),
-  modal:        $('#modal'),
-  modalClose:   $('#modalClose'),
-  modalCancel:  $('#modalCancel'),
-  modalSave:    $('#modalSave'),
-  nameInput:    $('#nameInput'),
-  petInput:     $('#petInput'),
+  distFlown:       $('#distFlown'),
+  distRemaining:   $('#distRemaining'),
+  etaValue:        $('#etaValue'),
+  etaSub:          $('#etaSub'),
 };
 
 /* ─────────────────────────────────────────
-   Persistence
+   Persistence (recent flights only)
    ───────────────────────────────────────── */
 function loadStored() {
   try {
     const raw = localStorage.getItem(CONFIG.storageKey);
     if (!raw) return;
     const data = JSON.parse(raw);
-    if (data.partnerName) { state.partnerName = data.partnerName; els.heroName.textContent = data.partnerName; }
-    if (data.petName) state.petName = data.petName;
     if (Array.isArray(data.recent)) state.recent = data.recent.slice(0, 6);
     renderRecent();
   } catch (_) { /* ignore */ }
 }
 function saveStored() {
   try {
-    localStorage.setItem(CONFIG.storageKey, JSON.stringify({
-      partnerName: state.partnerName,
-      petName: state.petName,
-      recent: state.recent,
-    }));
+    localStorage.setItem(CONFIG.storageKey, JSON.stringify({ recent: state.recent }));
   } catch (_) { /* ignore */ }
 }
 function pushRecent(flightNumber) {
@@ -417,22 +399,14 @@ function normalizeFlight(input) {
   return input.trim().toUpperCase().replace(/\s+/g, '');
 }
 
-/** Convert a typed flight number ("BA286") into possible OpenSky callsigns ("BAW286"). */
+/** Convert a typed flight number ("BA286") into possible callsigns ("BAW286"). */
 function flightToCallsigns(flight) {
-  // Already an ICAO callsign? (3 letters + digits) → use directly.
   const m = flight.match(/^([A-Z0-9]{2,3})(\d{1,5}[A-Z]?)$/);
   if (!m) return [];
-
   const prefix = m[1], num = m[2];
   const candidates = new Set();
-
-  // Direct as-is (in case user typed the ICAO code already, e.g. "BAW286")
-  candidates.add(prefix + num);
-
-  // IATA → ICAO airline mapping
+  candidates.add(prefix + num);                          // already ICAO?
   if (AIRLINES[prefix]) candidates.add(AIRLINES[prefix] + num);
-  // 2-char alphanumeric IATA codes (B6, 6E, etc.) handled above
-
   return [...candidates];
 }
 
@@ -442,14 +416,11 @@ function greatCirclePath(lat1, lon1, lat2, lon2, n = 128) {
   const toDeg = (r) => r * 180 / Math.PI;
   const φ1 = toRad(lat1), λ1 = toRad(lon1);
   const φ2 = toRad(lat2), λ2 = toRad(lon2);
-  const Δσ = Math.acos(
-    Math.min(1, Math.max(-1,
-      Math.sin(φ1) * Math.sin(φ2) +
-      Math.cos(φ1) * Math.cos(φ2) * Math.cos(λ2 - λ1)
-    ))
-  );
+  const Δσ = Math.acos(Math.min(1, Math.max(-1,
+    Math.sin(φ1) * Math.sin(φ2) +
+    Math.cos(φ1) * Math.cos(φ2) * Math.cos(λ2 - λ1)
+  )));
   if (Δσ === 0) return [[lat1, lon1], [lat2, lon2]];
-
   const points = [];
   for (let i = 0; i <= n; i++) {
     const f = i / n;
@@ -476,60 +447,68 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-function formatKm(km)    { return `${km.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ',')} km`; }
-function formatMiles(km) { return `${(km * 0.621371).toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ',')} mi`; }
-function formatFt(m)     { return `${(m * 3.28084).toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ',')}`; }
-function formatMph(mps)  { return `${(mps * 2.23694).toFixed(0)}`; }
-
+const fmt = (n) => Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+function formatKm(km)              { return `${fmt(km)} km`; }
+function formatFt(ft)              { return fmt(ft); }            // already feet from adsb.lol
+function formatMphFromKt(kt)       { return `${Math.round(kt * 1.15078)}`; }
 function formatRelative(secsAgo) {
   if (secsAgo < 60) return `${Math.max(0, Math.floor(secsAgo))}s ago`;
   if (secsAgo < 3600) return `${Math.floor(secsAgo / 60)}m ago`;
   return `${Math.floor(secsAgo / 3600)}h ago`;
 }
+function setUpdated(secsAgo) {
+  if (secsAgo == null || !isFinite(secsAgo)) { els.lastUpdated.textContent = '—'; return; }
+  els.lastUpdated.textContent = `updated ${formatRelative(secsAgo)}`;
+}
+function numOrNull(v) { return (typeof v === 'number' && isFinite(v)) ? v : null; }
 
-function setUpdated(timestampSec) {
-  if (!timestampSec) { els.lastUpdated.textContent = '—'; return; }
-  const ago = (Date.now() / 1000) - timestampSec;
-  els.lastUpdated.textContent = `updated ${formatRelative(ago)}`;
+/* ─────────────────────────────────────────
+   API — adsb.lol: live aircraft by callsign
+   ───────────────────────────────────────── */
+async function fetchAircraftByCallsign(callsign) {
+  const url = `${CONFIG.adsbBase}/callsign/${encodeURIComponent(callsign)}`;
+  const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+  if (!res.ok) throw new Error(`adsb.lol returned ${res.status}`);
+  const data = await res.json();
+  const list = (data && data.ac) || [];
+  if (!list.length) return null;
+
+  const target = callsign.trim().toUpperCase();
+  const withPos = list.filter(a => a.lat != null && a.lon != null);
+  const exact = withPos.find(a => (a.flight || '').trim().toUpperCase() === target);
+  return exact || withPos[0] || list[0];
 }
 
 /* ─────────────────────────────────────────
-   API calls
+   API — hexdb.io: route by callsign
    ───────────────────────────────────────── */
-async function fetchAllStates() {
-  const url = `${CONFIG.apiBase}/states/all`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`OpenSky returned ${res.status}`);
-  return res.json();
-}
-
-async function fetchFlightsForAircraft(icao24) {
-  const now = Math.floor(Date.now() / 1000);
-  const begin = now - CONFIG.flightHistoryWindowSec;
-  const url = `${CONFIG.apiBase}/flights/aircraft?icao24=${icao24}&begin=${begin}&end=${now}`;
+async function fetchRouteByCallsign(callsign) {
   try {
-    const res = await fetch(url);
+    const cs = (callsign || '').trim();
+    if (!cs) return null;
+    const url = `${CONFIG.hexdbBase}/route/icao/${encodeURIComponent(cs)}`;
+    const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
     if (!res.ok) return null;
-    return res.json();
+    const data = await res.json();
+    if (!data || !data.route) return null;
+    const parts = String(data.route).split('-').map(s => s.trim()).filter(Boolean);
+    if (parts.length < 2) return null;
+    return { fromIcao: parts[0], toIcao: parts[parts.length - 1] };
   } catch {
     return null;
   }
 }
 
 /* ─────────────────────────────────────────
-   Map setup
+   Map
    ───────────────────────────────────────── */
 function ensureMap() {
   if (state.map) return state.map;
   state.map = L.map('map', {
-    zoomControl: true,
-    attributionControl: true,
-    worldCopyJump: true,
-    minZoom: 2,
-    maxZoom: 12,
+    zoomControl: true, attributionControl: true, worldCopyJump: true,
+    minZoom: 2, maxZoom: 12,
   }).setView([20, 0], 2);
 
-  // Dark, label-rich basemap from CartoDB (free, no API key needed)
   L.tileLayer(
     'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
     {
@@ -538,7 +517,6 @@ function ensureMap() {
       maxZoom: 18,
     }
   ).addTo(state.map);
-
   return state.map;
 }
 
@@ -548,17 +526,14 @@ function clearMapLayers() {
   });
 }
 
-/** Build a divIcon for an airport marker. */
-function airportIcon(kind /* 'from' | 'to' */) {
+function airportIcon(kind) {
   return L.divIcon({
     className: '',
     html: `<div class="airport-marker ${kind}"></div>`,
-    iconSize: [18, 18],
-    iconAnchor: [9, 9],
+    iconSize: [18, 18], iconAnchor: [9, 9],
   });
 }
 
-/** Build a divIcon for the live aircraft, rotated to its heading. */
 function planeIcon(headingDeg) {
   const rot = headingDeg ?? 0;
   return L.divIcon({
@@ -569,31 +544,26 @@ function planeIcon(headingDeg) {
           <path d="M12 2 L13.5 9 L22 12 L13.5 13.5 L12 22 L10.5 13.5 L2 12 L10.5 9 Z"/>
         </svg>
       </div>`,
-    iconSize: [36, 36],
-    iconAnchor: [18, 18],
+    iconSize: [36, 36], iconAnchor: [18, 18],
   });
 }
 
 /* ─────────────────────────────────────────
-   Render: route + plane on map
+   Render: route, plane, stats
    ───────────────────────────────────────── */
 function renderRoute(from, to) {
   const path = greatCirclePath(from.lat, from.lon, to.lat, to.lon, 128);
-
   state.routeLayer = L.polyline(path, {
-    color: '#e9b872',
-    weight: 2,
-    opacity: 0.55,
-    dashArray: '6, 8',
-    lineCap: 'round',
+    color: '#e9b872', weight: 2, opacity: 0.55,
+    dashArray: '6, 8', lineCap: 'round',
   }).addTo(state.map);
 
   state.fromMarker = L.marker([from.lat, from.lon], { icon: airportIcon('from') })
-    .bindTooltip(`${from.iata} · ${from.city}`, { direction: 'top', offset: [0, -10], permanent: false })
+    .bindTooltip(`${from.iata} · ${from.city}`, { direction: 'top', offset: [0, -10] })
     .addTo(state.map);
 
   state.toMarker = L.marker([to.lat, to.lon], { icon: airportIcon('to') })
-    .bindTooltip(`${to.iata} · ${to.city}`, { direction: 'top', offset: [0, -10], permanent: false })
+    .bindTooltip(`${to.iata} · ${to.city}`, { direction: 'top', offset: [0, -10] })
     .addTo(state.map);
 }
 
@@ -601,10 +571,7 @@ function renderFlownPath(from, currentLat, currentLon) {
   if (state.flownLayer) state.map.removeLayer(state.flownLayer);
   const flown = greatCirclePath(from.lat, from.lon, currentLat, currentLon, 64);
   state.flownLayer = L.polyline(flown, {
-    color: '#f4cf94',
-    weight: 3,
-    opacity: 0.9,
-    lineCap: 'round',
+    color: '#f4cf94', weight: 3, opacity: 0.9, lineCap: 'round',
   }).addTo(state.map);
 }
 
@@ -614,51 +581,39 @@ function renderPlane(lat, lon, heading) {
     state.planeMarker.setIcon(planeIcon(heading));
   } else {
     state.planeMarker = L.marker([lat, lon], {
-      icon: planeIcon(heading),
-      zIndexOffset: 1000,
+      icon: planeIcon(heading), zIndexOffset: 1000,
     }).addTo(state.map);
   }
 }
 
-/** Fit map to show route + plane neatly. */
 function fitMapToFlight(from, to, planeLat, planeLon) {
   const points = [];
   if (from) points.push([from.lat, from.lon]);
   if (to)   points.push([to.lat, to.lon]);
   if (planeLat != null && planeLon != null) points.push([planeLat, planeLon]);
-
-  if (points.length === 1) {
-    state.map.setView(points[0], 6);
-  } else {
-    state.map.fitBounds(points, { padding: [60, 60], maxZoom: 7 });
-  }
+  if (points.length === 1) state.map.setView(points[0], 6);
+  else if (points.length > 1) state.map.fitBounds(points, { padding: [60, 60], maxZoom: 7 });
 }
 
-/* ─────────────────────────────────────────
-   Render: stats panel
-   ───────────────────────────────────────── */
-function renderStats(planeState, route) {
-  const altitudeM = planeState.geo_altitude ?? planeState.baro_altitude;
-  const velocity  = planeState.velocity;       // m/s
-  const heading   = planeState.true_track;     // degrees
-  const origin    = planeState.origin_country; // string
-  const lat       = planeState.latitude;
-  const lon       = planeState.longitude;
-  const callsign  = (planeState.callsign || '').trim();
+/** ac is an adsb.lol aircraft object. */
+function renderStats(ac, route) {
+  const altFt    = numOrNull(ac.alt_geom) ?? numOrNull(ac.alt_baro);
+  const speedKt  = numOrNull(ac.gs);
+  const heading  = numOrNull(ac.track);
+  const lat      = numOrNull(ac.lat);
+  const lon      = numOrNull(ac.lon);
+  const callsign = (ac.flight || '').trim();
 
   els.callsignBadge.textContent = callsign || '—';
-  els.statAltitude.innerHTML = altitudeM != null
-    ? `${formatFt(altitudeM)} <span class="unit">ft</span>`
-    : '— <span class="unit">ft</span>';
-  els.statSpeed.innerHTML = velocity != null
-    ? `${formatMph(velocity)} <span class="unit">mph</span>`
-    : '— <span class="unit">mph</span>';
+  els.statAltitude.innerHTML = altFt != null
+    ? `${formatFt(altFt)} <span class="unit">ft</span>` : '— <span class="unit">ft</span>';
+  els.statSpeed.innerHTML = speedKt != null
+    ? `${formatMphFromKt(speedKt)} <span class="unit">mph</span>` : '— <span class="unit">mph</span>';
   els.statHeading.innerHTML = heading != null
-    ? `${heading.toFixed(0)} <span class="unit">°</span>`
-    : '— <span class="unit">°</span>';
-  els.statOrigin.textContent = origin || '—';
+    ? `${Math.round(heading)} <span class="unit">°</span>` : '— <span class="unit">°</span>';
+  els.statOrigin.textContent = (route && route.from)
+    ? `${route.from.city} ${route.from.iata}` : '—';
 
-  // Route-dependent values
   if (route && route.from && route.to && lat != null && lon != null) {
     els.fromAirport.textContent = `${route.from.city} ${route.from.iata}`;
     els.toAirport.textContent   = `${route.to.city} ${route.to.iata}`;
@@ -673,31 +628,27 @@ function renderStats(planeState, route) {
     els.progressFill.style.width  = `${pct}%`;
     els.progressPlane.style.left  = `${pct}%`;
     els.progressPercent.textContent = `${pct.toFixed(0)}%`;
-
     els.distFlown.textContent     = `${formatKm(flownKm)} flown`;
     els.distRemaining.textContent = `${formatKm(remainingKm)} to go`;
 
-    // ETA from speed + remaining distance
-    if (velocity && velocity > 50) {
-      const remainingHours = (remainingKm * 1000) / velocity / 3600;
+    if (speedKt && speedKt > 100) {
+      const speedKmh = speedKt * 1.852;
+      const remainingHours = remainingKm / speedKmh;
       const arrivalDate = new Date(Date.now() + remainingHours * 3600 * 1000);
       const hh = arrivalDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      els.etaValue.textContent = hh;
       const hours = Math.floor(remainingHours);
       const mins  = Math.round((remainingHours - hours) * 60);
-      els.etaSub.textContent  = `~${hours}h ${mins}m left · landing in ${route.to.city}`;
+      els.etaValue.textContent = hh;
+      els.etaSub.textContent   = `~${hours}h ${mins}m left · landing in ${route.to.city}`;
     } else {
       els.etaValue.textContent = '—';
       els.etaSub.textContent   = `landing in ${route.to.city}`;
     }
 
-    els.loveNoteText.textContent = makeLoveNote({
-      altitudeM, velocity, route, flownKm, remainingKm, pct,
-    });
+    els.loveNoteText.textContent = makeLoveNote({ altFt, route, flownKm, remainingKm, pct });
   } else {
-    // Live position only — no full route
     els.fromAirport.textContent = '—';
-    els.toAirport.textContent   = origin || '—';
+    els.toAirport.textContent   = '—';
     els.progressFromCode.textContent = '—';
     els.progressToCode.textContent   = '—';
     els.progressFill.style.width = '0%';
@@ -707,39 +658,34 @@ function renderStats(planeState, route) {
     els.distRemaining.textContent = '—';
     els.etaValue.textContent = '—';
     els.etaSub.textContent   = 'route data unavailable — showing live position only';
-
-    els.loveNoteText.textContent = altitudeM
-      ? `Cruising over ${origin || 'the world'} at ${formatFt(altitudeM)} feet — somewhere up there.`
-      : `Currently airborne. We've got eyes on the radar.`;
+    els.loveNoteText.textContent = altFt
+      ? `${CONFIG.partnerName} is cruising at ${formatFt(altFt)} ft — somewhere up there.`
+      : `${CONFIG.partnerName} is currently airborne. We've got eyes on the radar.`;
   }
 }
 
-/** Sweet/fun status message that varies with flight state. */
-function makeLoveNote({ altitudeM, velocity, route, flownKm, remainingKm, pct }) {
-  const name = state.partnerName !== 'her' ? state.partnerName : (state.petName || 'she');
-  const opener = name && name !== 'her' && name !== 'she' ? name : 'She';
-
-  if (pct > 92) return `Almost there. ${opener}'s descending into ${route.to.city} — go meet them at the gate.`;
-  if (pct > 70) return `${opener}'s on the home stretch — only ${formatKm(remainingKm)} between you.`;
-  if (pct > 40) return `Halfway. ${opener} is cruising at ${formatFt(altitudeM)} ft, somewhere over the world.`;
-  if (pct > 15) return `${opener}'s found their altitude. Window seat or aisle?`;
-  if (pct > 2)  return `Just took off. ${opener}'s climbing, the city falling away below.`;
-  return `Wheels up. ${opener}'s flight has begun.`;
+function makeLoveNote({ altFt, route, flownKm, remainingKm, pct }) {
+  const name = CONFIG.partnerName;
+  if (pct > 92) return `Almost there. ${name} is descending into ${route.to.city} — go meet her at the gate.`;
+  if (pct > 70) return `${name}'s on the home stretch — only ${formatKm(remainingKm)} between you.`;
+  if (pct > 40) return `Halfway. ${name} is cruising at ${formatFt(altFt)} ft, somewhere over the world.`;
+  if (pct > 15) return `${name} has found her altitude. Window seat or aisle?`;
+  if (pct > 2)  return `Just took off. ${name} is climbing — the city falling away below.`;
+  return `Wheels up. ${name}'s flight has begun.`;
 }
 
 /* ─────────────────────────────────────────
-   Section visibility
+   Section visibility / errors
    ───────────────────────────────────────── */
-function showOnly(section /* 'hero' | 'tracker' | 'loading' | 'error' */) {
+function showOnly(section /* hero | tracker | loading | error */) {
   els.hero.hidden    = section !== 'hero';
   els.tracker.hidden = section !== 'tracker';
   els.loading.hidden = section !== 'loading';
   els.error.hidden   = section !== 'error';
 }
-
 function showError(title, sub) {
   els.errorTitle.textContent = title;
-  els.errorSub.textContent   = sub || els.errorSub.textContent;
+  els.errorSub.textContent   = sub || '';
   showOnly('error');
 }
 
@@ -753,188 +699,105 @@ async function trackFlight(rawInput) {
   pushRecent(flight);
   showOnly('loading');
 
+  if (state.refreshTimer) { clearInterval(state.refreshTimer); state.refreshTimer = null; }
+
   const candidates = flightToCallsigns(flight);
   if (!candidates.length) {
-    showError(
-      "That doesn't look like a flight number.",
-      'Try something like BA286, AA100, or LH441.'
-    );
+    showError("That doesn't look like a flight number.",
+              'Try something like BA286, AA100, or LH441.');
     return;
   }
 
-  let allStates;
-  try {
-    allStates = await fetchAllStates();
-  } catch (err) {
-    console.error(err);
-    showError(
-      'Radar is offline right now.',
-      "OpenSky's public API is rate-limited or blocked. Try again in a minute."
-    );
-    return;
+  let aircraft = null, usedCallsign = null, lastErr = null;
+  for (const cs of candidates) {
+    try {
+      const ac = await fetchAircraftByCallsign(cs);
+      if (ac) { aircraft = ac; usedCallsign = cs; break; }
+    } catch (err) { lastErr = err; }
   }
 
-  // Match the first state whose callsign starts with one of our candidates
-  const states = allStates.states || [];
-  let match = null;
-  for (const s of states) {
-    const cs = (s[1] || '').trim().toUpperCase();
-    if (!cs) continue;
-    if (candidates.some(c => cs === c || cs.startsWith(c))) {
-      match = s; break;
+  if (!aircraft) {
+    if (lastErr) {
+      console.error(lastErr);
+      showError('Radar is offline right now.',
+                "Couldn't reach the live tracking network. Try again in a minute.");
+    } else {
+      showError(`Couldn't find ${flight} in the air right now.`,
+                "She might be on the ground, just landed, or outside our radar window. Try again in a few minutes.");
     }
-  }
-
-  if (!match) {
-    showError(
-      `Couldn't find ${flight} in the air right now.`,
-      "It might be on the ground, just landed, or outside our radar window. Try again in a few minutes."
-    );
     return;
   }
 
-  // Parse state vector
-  const planeState = parseStateVector(match);
-  state.currentCallsign = (planeState.callsign || '').trim();
-  state.currentIcao24   = planeState.icao24;
+  state.currentCallsign = (aircraft.flight || usedCallsign || '').trim();
+  state.currentIcao24   = aircraft.hex;
 
-  // Set up the tracker view
   showOnly('tracker');
   ensureMap();
-  // Force Leaflet to recompute size after becoming visible
   setTimeout(() => state.map.invalidateSize(), 50);
-
   clearMapLayers();
 
-  // Try to enrich with route info
+  // Try route lookup
   let route = null;
-  const flights = await fetchFlightsForAircraft(planeState.icao24);
-  if (Array.isArray(flights) && flights.length) {
-    // Find the most recent flight that's still active or just ended
-    const f = flights[flights.length - 1];
-    const fromAirport = f.estDepartureAirport && AIRPORTS[f.estDepartureAirport];
-    const toAirport   = f.estArrivalAirport   && AIRPORTS[f.estArrivalAirport];
-    if (fromAirport && toAirport) {
-      route = { from: fromAirport, to: toAirport };
-    }
+  const r = await fetchRouteByCallsign(state.currentCallsign || usedCallsign);
+  if (r) {
+    const fromAp = AIRPORTS[r.fromIcao];
+    const toAp   = AIRPORTS[r.toIcao];
+    if (fromAp && toAp) route = { from: fromAp, to: toAp };
   }
   state.currentRoute = route;
 
-  // Render
-  if (route) {
-    renderRoute(route.from, route.to);
-    renderFlownPath(route.from, planeState.latitude, planeState.longitude);
+  if (state.currentRoute) {
+    renderRoute(state.currentRoute.from, state.currentRoute.to);
+    if (aircraft.lat != null && aircraft.lon != null) {
+      renderFlownPath(state.currentRoute.from, aircraft.lat, aircraft.lon);
+    }
   }
-  renderPlane(planeState.latitude, planeState.longitude, planeState.true_track);
-  fitMapToFlight(route?.from, route?.to, planeState.latitude, planeState.longitude);
-  renderStats(planeState, route);
-  setUpdated(planeState.last_contact);
+  if (aircraft.lat != null && aircraft.lon != null) {
+    renderPlane(aircraft.lat, aircraft.lon, aircraft.track);
+  }
+  fitMapToFlight(state.currentRoute?.from, state.currentRoute?.to, aircraft.lat, aircraft.lon);
+  renderStats(aircraft, state.currentRoute);
+  setUpdated(typeof aircraft.seen_pos === 'number' ? aircraft.seen_pos : aircraft.seen);
 
-  // Schedule auto-refresh
-  if (state.refreshTimer) clearInterval(state.refreshTimer);
   state.refreshTimer = setInterval(refreshLivePosition, CONFIG.refreshMs);
 }
 
-/** Parse OpenSky state vector array into a friendly object. */
-function parseStateVector(s) {
-  return {
-    icao24: s[0],
-    callsign: s[1],
-    origin_country: s[2],
-    time_position: s[3],
-    last_contact: s[4],
-    longitude: s[5],
-    latitude: s[6],
-    baro_altitude: s[7],
-    on_ground: s[8],
-    velocity: s[9],
-    true_track: s[10],
-    vertical_rate: s[11],
-    geo_altitude: s[13],
-  };
-}
-
-/** Pull just the latest position for the current aircraft (no full re-search). */
 async function refreshLivePosition() {
-  if (!state.currentIcao24) return;
+  if (!state.currentCallsign) return;
   try {
-    // OpenSky supports filtering by icao24 directly
-    const res = await fetch(`${CONFIG.apiBase}/states/all?icao24=${state.currentIcao24}`);
-    if (!res.ok) return;
-    const data = await res.json();
-    const first = (data.states || [])[0];
-    if (!first) {
-      // Plane is no longer reporting (might have landed)
+    const ac = await fetchAircraftByCallsign(state.currentCallsign);
+    if (!ac || ac.lat == null || ac.lon == null) {
       els.lastUpdated.textContent = 'no recent position';
       return;
     }
-    const ps = parseStateVector(first);
-    if (ps.latitude == null || ps.longitude == null) return;
-
-    renderPlane(ps.latitude, ps.longitude, ps.true_track);
+    renderPlane(ac.lat, ac.lon, ac.track);
     if (state.currentRoute && state.currentRoute.from) {
-      renderFlownPath(state.currentRoute.from, ps.latitude, ps.longitude);
+      renderFlownPath(state.currentRoute.from, ac.lat, ac.lon);
     }
-    renderStats(ps, state.currentRoute);
-    setUpdated(ps.last_contact);
-  } catch (err) {
-    /* silent — we'll try again next interval */
-  }
+    renderStats(ac, state.currentRoute);
+    setUpdated(typeof ac.seen_pos === 'number' ? ac.seen_pos : ac.seen);
+  } catch (err) { /* silent — try again next tick */ }
 }
 
 /* ─────────────────────────────────────────
-   Personalize modal
+   Wire up events (defensively)
    ───────────────────────────────────────── */
-function openModal() {
-  els.modal.hidden = false;
-  els.nameInput.value = state.partnerName !== 'her' ? state.partnerName : '';
-  els.petInput.value  = state.petName || '';
-  setTimeout(() => els.nameInput.focus(), 60);
-}
-function closeModal() { els.modal.hidden = true; }
-function saveModal() {
-  const n = els.nameInput.value.trim();
-  const p = els.petInput.value.trim();
-  state.partnerName = n || 'her';
-  state.petName = p;
-  els.heroName.textContent = state.partnerName;
-  saveStored();
-  closeModal();
+function safeOn(el, type, handler) {
+  if (!el) return;
+  try { el.addEventListener(type, handler); } catch (e) { console.warn('listener', type, e); }
 }
 
-/* ─────────────────────────────────────────
-   Wire up events
-   ───────────────────────────────────────── */
-els.form.addEventListener('submit', (e) => {
+safeOn(els.form, 'submit', (e) => {
   e.preventDefault();
   trackFlight(els.input.value);
 });
 
-els.refreshBtn.addEventListener('click', () => {
+safeOn(els.refreshBtn, 'click', () => {
   els.refreshBtn.classList.add('spinning');
   refreshLivePosition().finally(() => {
     setTimeout(() => els.refreshBtn.classList.remove('spinning'), 600);
   });
 });
-
-els.personalizeBtn.addEventListener('click', openModal);
-els.modalClose.addEventListener('click', closeModal);
-els.modalCancel.addEventListener('click', closeModal);
-els.modalSave.addEventListener('click', saveModal);
-els.modal.addEventListener('click', (e) => {
-  if (e.target === els.modal) closeModal();
-});
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !els.modal.hidden) closeModal();
-});
-
-// Periodically refresh the "updated Xs ago" pill
-setInterval(() => {
-  if (els.tracker.hidden) return;
-  const text = els.lastUpdated.textContent;
-  // If the last_contact timestamp is captured in setUpdated, we just leave the
-  // string as is between full refreshes — not worth re-wiring. (Looks fine.)
-}, 10_000);
 
 /* ─────────────────────────────────────────
    Boot
