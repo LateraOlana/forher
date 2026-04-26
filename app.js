@@ -314,7 +314,9 @@ const state = {
   fromMarker: null,
   toMarker: null,
   planeMarker: null,
-  refreshTimer: null,
+  refreshTimer:   null,  // 30s API poll for real position updates
+  animationTimer: null,  // 1s tick for dead-reckoning the plane between polls
+  lastFix:        null,  // { lat, lon, speedKt, headingDeg, altFt, time, raw }
   currentCallsign: null,
   currentIcao24: null,
   currentRoute: null,
@@ -340,7 +342,7 @@ const els = {
   fromAirport:     $('#fromAirport'),
   toAirport:       $('#toAirport'),
   lastUpdated:     $('#lastUpdated'),
-  refreshBtn:      $('#refreshBtn'),
+  refreshBtn:      null,  // removed — auto-updating now
   statAltitude:    $('#statAltitude'),
   statSpeed:       $('#statSpeed'),
   statHeading:     $('#statHeading'),
@@ -452,6 +454,32 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
+/** Initial bearing in degrees (0–360) along the great circle from p1 to p2. */
+function bearingDeg(lat1, lon1, lat2, lon2) {
+  const φ1 = lat1 * Math.PI / 180;
+  const φ2 = lat2 * Math.PI / 180;
+  const Δλ = (lon2 - lon1) * Math.PI / 180;
+  const y  = Math.sin(Δλ) * Math.cos(φ2);
+  const x  = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  return ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
+}
+
+/** Project a starting point along an initial bearing for distanceKm.
+ *  Used for dead-reckoning the plane's position between API polls. */
+function projectByBearing(lat, lon, bearingDegrees, distanceKm) {
+  const R  = 6371;
+  const δ  = distanceKm / R;
+  const θ  = bearingDegrees * Math.PI / 180;
+  const φ1 = lat * Math.PI / 180;
+  const λ1 = lon * Math.PI / 180;
+  const φ2 = Math.asin(Math.sin(φ1) * Math.cos(δ) + Math.cos(φ1) * Math.sin(δ) * Math.cos(θ));
+  const λ2 = λ1 + Math.atan2(
+    Math.sin(θ) * Math.sin(δ) * Math.cos(φ1),
+    Math.cos(δ) - Math.sin(φ1) * Math.sin(φ2)
+  );
+  return [φ2 * 180 / Math.PI, ((λ2 * 180 / Math.PI + 540) % 360) - 180];
+}
+
 const fmt = (n) => Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 function formatKm(km)              { return `${fmt(km)} km`; }
 function formatFt(ft)              { return fmt(ft); }            // already feet from adsb.lol
@@ -491,19 +519,61 @@ async function corsFetch(targetUrl) {
   return res;
 }
 
-async function fetchAircraftByCallsign(callsign) {
+/** Returns an array of candidate aircraft (with positions) matching the
+ *  callsign. Exact callsign matches are preferred; if none match exactly we
+ *  still return any positioned aircraft so the route-based picker can score
+ *  them. May return [] if none are airborne with that callsign. */
+async function fetchAircraftListByCallsign(callsign) {
   const url = `${CONFIG.adsbBase}/callsign/${encodeURIComponent(callsign)}`;
   console.log('[skyward] fetching aircraft for callsign', callsign);
   const res = await corsFetch(url);
   const data = await res.json();
   const list = (data && data.ac) || [];
   console.log('[skyward] adsb.lol returned', list.length, 'aircraft for', callsign);
-  if (!list.length) return null;
+  if (!list.length) return [];
+
+  const withPos = list.filter(a => a.lat != null && a.lon != null);
+  if (!withPos.length) return [];
 
   const target = callsign.trim().toUpperCase();
-  const withPos = list.filter(a => a.lat != null && a.lon != null);
-  const exact = withPos.find(a => (a.flight || '').trim().toUpperCase() === target);
-  return exact || withPos[0] || list[0];
+  const exact = withPos.filter(a => (a.flight || '').trim().toUpperCase() === target);
+  return exact.length ? exact : withPos;
+}
+
+/** Score an aircraft on how plausible it is for the given route.
+ *  Higher = better. 100 = perfectly on path with right heading. */
+function scoreRouteConsistency(ac, route) {
+  if (!route || ac.lat == null || ac.lon == null) return 0;
+  let score = 100;
+
+  // Off-path penalty: detour = (origin→ac) + (ac→dest) − (origin→dest). 0 = on path.
+  const totalKm    = haversineKm(route.from.lat, route.from.lon, route.to.lat, route.to.lon);
+  const fromDistKm = haversineKm(route.from.lat, route.from.lon, ac.lat, ac.lon);
+  const toDistKm   = haversineKm(route.to.lat,   route.to.lon,   ac.lat, ac.lon);
+  const detour     = Math.max(0, (fromDistKm + toDistKm) - totalKm);
+  score -= detour / 50;  // ~1 point per 50 km off-path
+
+  // Heading should point roughly toward the destination
+  if (typeof ac.track === 'number') {
+    const bToDest = bearingDeg(ac.lat, ac.lon, route.to.lat, route.to.lon);
+    const diff    = Math.abs(((ac.track - bToDest + 540) % 360) - 180);
+    score -= diff / 5;  // ~1 point per 5° of heading mismatch
+  }
+  return score;
+}
+
+/** Among multiple aircraft sharing a callsign, pick the one whose position
+ *  and heading are most consistent with the looked-up route. If route is
+ *  unknown, just return the first. */
+function pickBestAircraft(list, route) {
+  if (!list.length) return null;
+  if (list.length === 1 || !route) return list[0];
+
+  const scored = list.map(a => ({ ac: a, score: scoreRouteConsistency(a, route) }));
+  scored.sort((x, y) => y.score - x.score);
+  console.log('[skyward] picked aircraft from', list.length, 'candidates; top score:',
+              scored[0].score.toFixed(1));
+  return scored[0].ac;
 }
 
 /* ─────────────────────────────────────────
@@ -679,11 +749,15 @@ function updateRouteLabels(from, to, timing) {
 }
 
 function renderFlownPath(from, currentLat, currentLon) {
-  if (state.flownLayer) state.map.removeLayer(state.flownLayer);
   const flown = greatCirclePath(from.lat, from.lon, currentLat, currentLon, 64);
-  state.flownLayer = L.polyline(flown, {
-    color: '#f4cf94', weight: 3, opacity: 0.9, lineCap: 'round',
-  }).addTo(state.map);
+  if (state.flownLayer) {
+    // Update in place — much cheaper than removing & re-adding every animation tick
+    state.flownLayer.setLatLngs(flown);
+  } else {
+    state.flownLayer = L.polyline(flown, {
+      color: '#f4cf94', weight: 3, opacity: 0.9, lineCap: 'round',
+    }).addTo(state.map);
+  }
 }
 
 function renderPlane(lat, lon, heading) {
@@ -837,7 +911,10 @@ async function trackFlight(rawInput) {
   pushRecent(flight);
   showOnly('loading');
 
+  // Stop any in-flight animation/poll from the previous track
+  stopAnimation();
   if (state.refreshTimer) { clearInterval(state.refreshTimer); state.refreshTimer = null; }
+  state.lastFix = null;
 
   const candidates = flightToCallsigns(flight);
   if (!candidates.length) {
@@ -846,15 +923,16 @@ async function trackFlight(rawInput) {
     return;
   }
 
-  let aircraft = null, usedCallsign = null, lastErr = null;
+  // Step 1: find a callsign that returns at least one airborne aircraft.
+  let aircraftList = [], usedCallsign = null, lastErr = null;
   for (const cs of candidates) {
     try {
-      const ac = await fetchAircraftByCallsign(cs);
-      if (ac) { aircraft = ac; usedCallsign = cs; break; }
+      const list = await fetchAircraftListByCallsign(cs);
+      if (list.length) { aircraftList = list; usedCallsign = cs; break; }
     } catch (err) { lastErr = err; }
   }
 
-  if (!aircraft) {
+  if (!aircraftList.length) {
     if (lastErr) {
       console.error('[skyward] all callsign lookups failed:', lastErr);
       showError('Radar is offline right now.',
@@ -866,49 +944,127 @@ async function trackFlight(rawInput) {
     return;
   }
 
+  // Step 2: look up the route by the same callsign that hit on adsb.lol.
+  const route = await fetchRouteByCallsign(usedCallsign);
+
+  // Step 3: pick the aircraft whose position + heading best fit that route.
+  // (Multiple planes can share a callsign; route-based scoring disambiguates.)
+  let aircraft = pickBestAircraft(aircraftList, route);
+
+  // Step 4: validate. If the best-fit aircraft is wildly inconsistent with
+  // the route, the route data is probably stale or wrong — drop it and just
+  // show live position rather than draw a misleading line on the map.
+  let confirmedRoute = route;
+  if (route) {
+    const score = scoreRouteConsistency(aircraft, route);
+    if (score < 30) {
+      console.warn('[skyward] aircraft score', score.toFixed(1),
+                   '— route data inconsistent with actual position; suppressing route');
+      confirmedRoute = null;
+    }
+  }
+  state.currentRoute    = confirmedRoute;
   state.currentCallsign = (aircraft.flight || usedCallsign || '').trim();
   state.currentIcao24   = aircraft.hex;
 
+  // Map setup
   showOnly('tracker');
   ensureMap();
   setTimeout(() => state.map.invalidateSize(), 50);
   clearMapLayers();
 
-  // Try route lookup — adsbdb returns full airport objects, hexdb falls back through our table
-  const route = await fetchRouteByCallsign(state.currentCallsign || usedCallsign);
-  state.currentRoute = route;
-
+  // Draw the route line + permanent labels (timing fills in via renderStats below)
   if (state.currentRoute) {
     renderRoute(state.currentRoute.from, state.currentRoute.to);
-    if (aircraft.lat != null && aircraft.lon != null) {
-      renderFlownPath(state.currentRoute.from, aircraft.lat, aircraft.lon);
+  }
+
+  // Frame the map around origin/destination/plane so everything is visible
+  fitMapToFlight(state.currentRoute?.from, state.currentRoute?.to, aircraft.lat, aircraft.lon);
+
+  // Snap to the first real fix and start the animation loop. The loop
+  // dead-reckons the plane forward every second so the map looks alive
+  // between 30s API polls.
+  applyAircraftUpdate(aircraft);
+  startAnimation();
+  state.refreshTimer = setInterval(refreshLivePosition, CONFIG.refreshMs);
+}
+
+/* ─────────────────────────────────────────
+   Live-position machinery
+   ─────────────────────────────────────────
+   Two timers run while a flight is being tracked:
+     • refreshTimer (30s) — hits adsb.lol for a fresh authoritative fix
+     • animationTimer (1s) — dead-reckons position forward along heading
+   The ground speed reported by ADS-B is true ground speed, so projecting
+   forward at that speed gives a very close approximation of the real path
+   between API hits. Each real fix snaps the plane to ground truth. */
+
+function applyAircraftUpdate(ac) {
+  state.lastFix = {
+    lat:        ac.lat,
+    lon:        ac.lon,
+    speedKt:    numOrNull(ac.gs),
+    headingDeg: numOrNull(ac.track),
+    altFt:      numOrNull(ac.alt_geom) ?? numOrNull(ac.alt_baro),
+    time:       Date.now(),
+    raw:        ac,                                  // keep for renderStats
+  };
+  renderFromFix();
+}
+
+function renderFromFix() {
+  const fix = state.lastFix;
+  if (!fix) return;
+
+  // Project the plane forward from its last real fix
+  let curLat = fix.lat, curLon = fix.lon;
+  if (fix.speedKt != null && fix.speedKt > 30 && fix.headingDeg != null) {
+    const elapsedSec = (Date.now() - fix.time) / 1000;
+    const speedKmh   = fix.speedKt * 1.852;
+    const distanceKm = speedKmh * (elapsedSec / 3600);
+    if (distanceKm > 0.02) {
+      [curLat, curLon] = projectByBearing(fix.lat, fix.lon, fix.headingDeg, distanceKm);
     }
   }
-  if (aircraft.lat != null && aircraft.lon != null) {
-    renderPlane(aircraft.lat, aircraft.lon, aircraft.track);
-  }
-  fitMapToFlight(state.currentRoute?.from, state.currentRoute?.to, aircraft.lat, aircraft.lon);
-  renderStats(aircraft, state.currentRoute);
-  setUpdated(typeof aircraft.seen_pos === 'number' ? aircraft.seen_pos : aircraft.seen);
 
-  state.refreshTimer = setInterval(refreshLivePosition, CONFIG.refreshMs);
+  renderPlane(curLat, curLon, fix.headingDeg);
+
+  if (state.currentRoute && state.currentRoute.from) {
+    renderFlownPath(state.currentRoute.from, curLat, curLon);
+  }
+
+  // Hand renderStats a synthetic aircraft with the interpolated position so
+  // ETA, progress, distance flown, love-note, and label timing all tick live.
+  const synthetic = { ...fix.raw, lat: curLat, lon: curLon };
+  renderStats(synthetic, state.currentRoute);
+
+  setUpdated((Date.now() - fix.time) / 1000);
+}
+
+function startAnimation() {
+  stopAnimation();
+  state.animationTimer = setInterval(renderFromFix, 1000);
+}
+function stopAnimation() {
+  if (state.animationTimer) {
+    clearInterval(state.animationTimer);
+    state.animationTimer = null;
+  }
 }
 
 async function refreshLivePosition() {
   if (!state.currentCallsign) return;
   try {
-    const ac = await fetchAircraftByCallsign(state.currentCallsign);
+    const list = await fetchAircraftListByCallsign(state.currentCallsign);
+    const ac   = pickBestAircraft(list, state.currentRoute);
     if (!ac || ac.lat == null || ac.lon == null) {
       els.lastUpdated.textContent = 'no recent position';
       return;
     }
-    renderPlane(ac.lat, ac.lon, ac.track);
-    if (state.currentRoute && state.currentRoute.from) {
-      renderFlownPath(state.currentRoute.from, ac.lat, ac.lon);
-    }
-    renderStats(ac, state.currentRoute);
-    setUpdated(typeof ac.seen_pos === 'number' ? ac.seen_pos : ac.seen);
-  } catch (err) { /* silent — try again next tick */ }
+    applyAircraftUpdate(ac);
+  } catch (err) {
+    console.warn('[skyward] live refresh failed:', err.message);
+  }
 }
 
 /* ─────────────────────────────────────────
@@ -922,13 +1078,6 @@ function safeOn(el, type, handler) {
 safeOn(els.form, 'submit', (e) => {
   e.preventDefault();
   trackFlight(els.input.value);
-});
-
-safeOn(els.refreshBtn, 'click', () => {
-  els.refreshBtn.classList.add('spinning');
-  refreshLivePosition().finally(() => {
-    setTimeout(() => els.refreshBtn.classList.remove('spinning'), 600);
-  });
 });
 
 /* ─────────────────────────────────────────
