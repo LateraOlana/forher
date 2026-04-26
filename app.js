@@ -14,6 +14,7 @@ const CONFIG = {
   adsbBase:   'https://api.adsb.lol/v2',
   adsbdbBase: 'https://api.adsbdb.com/v0',  // route lookups (origin + destination with coords)
   hexdbBase:  'https://hexdb.io/api/v1',    // fallback route lookup
+  weatherBase:'https://api.open-meteo.com/v1/forecast',  // weather at destination — free, no key
   // Public CORS proxies. We try each in order if direct browser fetch fails.
   // Multiple options because POST behavior varies between proxies and any
   // single proxy can rate-limit or go down.
@@ -22,8 +23,9 @@ const CONFIG = {
     url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
     url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
   ],
-  refreshMs:  30_000,                  // re-poll live position every 30s
-  storageKey: 'skyward.v2',
+  refreshMs:        30_000,                // re-poll live position every 30s
+  weatherRefreshMs: 10 * 60_000,           // weather every 10 min
+  storageKey:  'skyward.v2',
   partnerName: 'Norma',
 };
 
@@ -320,7 +322,9 @@ const state = {
   planeMarker: null,
   refreshTimer:   null,  // 30s API poll for real position updates
   animationTimer: null,  // 1s tick for dead-reckoning the plane between polls
+  weatherTimer:   null,  // 10min refresh for destination weather
   lastFix:        null,  // { lat, lon, speedKt, headingDeg, altFt, time, raw }
+  lastWeather:    null,  // last Open-Meteo `current` payload, used by transport notes
   currentCallsign: null,
   currentIcao24: null,
   currentRoute: null,
@@ -362,6 +366,16 @@ const els = {
   distRemaining:   $('#distRemaining'),
   etaValue:        $('#etaValue'),
   etaSub:          $('#etaSub'),
+  // Arrival card (weather + transport)
+  arrivalCard:      $('#arrivalCard'),
+  arrivalCity:      $('#arrivalCity'),
+  arrivalLocalTime: $('#arrivalLocalTime'),
+  weatherIcon:      $('#weatherIcon'),
+  weatherTemp:      $('#weatherTemp'),
+  weatherCond:      $('#weatherCond'),
+  weatherDetail:    $('#weatherDetail'),
+  weatherNote:      $('#weatherNote'),
+  transportNote:    $('#transportNote'),
 };
 
 /* ─────────────────────────────────────────
@@ -886,6 +900,287 @@ function computeTiming(speedKt, flownKm, remainingKm) {
   return out;
 }
 
+/* ─────────────────────────────────────────
+   Destination weather (Open-Meteo) + cute notes
+   Open-Meteo is free, no key needed, and CORS-friendly. We pull the current
+   conditions for the destination airport coords and turn the result into a
+   warm, plain-English what-to-wear note. Refreshes every 10 minutes.
+   ───────────────────────────────────────── */
+
+async function fetchDestinationWeather(lat, lon) {
+  const params = new URLSearchParams({
+    latitude:           String(lat),
+    longitude:          String(lon),
+    current:            'temperature_2m,apparent_temperature,weather_code,wind_speed_10m,precipitation,is_day',
+    temperature_unit:   'fahrenheit',
+    wind_speed_unit:    'mph',
+  });
+  const url = `${CONFIG.weatherBase}?${params}`;
+  const res = await corsFetch(url);
+  const data = await res.json();
+  return data.current || null;
+}
+
+// WMO weather code → friendly label and a small monochrome glyph
+function decodeWeather(code, isDay) {
+  const t = (day, night) => isDay === 0 ? night : day;
+  const codes = {
+    0:  ['Clear sky',           t('☼','☾')],
+    1:  ['Mostly clear',        t('☼','☾')],
+    2:  ['Partly cloudy',       '☁'],
+    3:  ['Overcast',            '☁'],
+    45: ['Foggy',               '≋'],
+    48: ['Freezing fog',        '≋'],
+    51: ['Light drizzle',       '☂'],
+    53: ['Drizzle',             '☂'],
+    55: ['Heavy drizzle',       '☂'],
+    61: ['Light rain',          '☂'],
+    63: ['Rain',                '☂'],
+    65: ['Heavy rain',          '☂'],
+    71: ['Light snow',          '❄'],
+    73: ['Snow',                '❄'],
+    75: ['Heavy snow',          '❄'],
+    77: ['Snow grains',         '❄'],
+    80: ['Showers',             '☂'],
+    81: ['Showers',             '☂'],
+    82: ['Heavy showers',       '☂'],
+    85: ['Snow showers',        '❄'],
+    86: ['Heavy snow showers',  '❄'],
+    95: ['Thunderstorm',        '⚡'],
+    96: ['Thunder + hail',      '⚡'],
+    99: ['Severe thunderstorm', '⚡'],
+  };
+  return codes[code] || ['Mixed conditions', '☁'];
+}
+
+// Cute "what to wear" note tuned to temperature + conditions
+function whatToWear(tempF, code, windMph, partnerName) {
+  const isRain  = (code >= 51 && code <= 67) || (code >= 80 && code <= 82);
+  const isSnow  = (code >= 71 && code <= 77) || (code >= 85 && code <= 86);
+  const isStorm = code >= 95;
+  const isWindy = windMph != null && windMph > 18;
+
+  let layer;
+  if      (tempF >= 88) layer = `linen and sandals — it's properly hot`;
+  else if (tempF >= 75) layer = `a tee and her favorite sundress — it's warm`;
+  else if (tempF >= 62) layer = `a light cardigan, just in case`;
+  else if (tempF >= 50) layer = `a real jacket — there's a bite in the air`;
+  else if (tempF >= 38) layer = `coat, scarf, the whole production`;
+  else if (tempF >= 25) layer = `the heaviest coat she has, plus gloves`;
+  else                   layer = `full winter armor — it's cold cold`;
+
+  const extras = [];
+  if (isRain)  extras.push("she'll want an umbrella");
+  if (isSnow)  extras.push("waterproof boots, no shortcuts");
+  if (isStorm) extras.push("just get inside fast");
+  if (isWindy && !isRain && !isSnow) extras.push("something with sleeves — it's blustery");
+
+  const tail = extras.length ? ` — ${extras.join(' & ')}.` : '.';
+  return `${partnerName || 'She'}'ll want ${layer}${tail}`;
+}
+
+/* ─────────────────────────────────────────
+   Airport transit lookup + transport notes
+   Small curated table for the busiest airports — when we recognize one we
+   give specific advice (which train, fare zone, etc). Otherwise we fall back
+   to a generic suggestion that still respects time-of-day and weather.
+   ───────────────────────────────────────── */
+const AIRPORT_TRANSIT = {
+  // North America
+  KJFK: { transit: 'AirTrain → LIRR to Penn (~35 min)',         rideshare: 'Uber ~$60–90 to Manhattan' },
+  KLGA: { transit: 'Q70 bus → 7 train (cheap, awkward)',         rideshare: 'Uber ~$45–60 to Manhattan' },
+  KEWR: { transit: 'AirTrain → NJ Transit to Penn (~30 min)',    rideshare: 'Uber ~$70–100 to NYC' },
+  KLAX: { transit: 'FlyAway bus or Metro K Line',                rideshare: 'Uber ~$45–70 most spots' },
+  KSFO: { transit: 'BART straight downtown (~30 min)',           rideshare: 'Uber ~$45–65 to SF' },
+  KOAK: { transit: 'AirConnect → BART (anywhere in the Bay)',    rideshare: 'Uber ~$35–55 to SF' },
+  KORD: { transit: "Blue Line CTA to the Loop (~45 min)",        rideshare: 'Uber ~$40–55 to downtown' },
+  KSEA: { transit: 'Link Light Rail to downtown (~40 min)',      rideshare: 'Uber ~$45–65 to downtown' },
+  KBOS: { transit: 'Silver Line bus — free and direct',          rideshare: 'Uber ~$30–45 to downtown' },
+  KDCA: { transit: 'Blue/Yellow Line metro right at terminal',   rideshare: 'Uber ~$15–25 to downtown' },
+  KIAD: { transit: 'Silver Line metro to DC (~50 min)',          rideshare: 'Uber ~$50–80 to DC' },
+  KBWI: { transit: 'MARC train to DC, Light Rail to Baltimore',  rideshare: 'Uber ~$50–75 to DC' },
+  KATL: { transit: 'MARTA train direct (~20 min)',               rideshare: 'Uber ~$30–45 to downtown' },
+  KMIA: { transit: 'Tri-Rail or Metrorail',                       rideshare: 'Uber ~$25–45 to South Beach' },
+  KIAH: { transit: '(transit is limited — rideshare is faster)', rideshare: 'Uber ~$40–60 to downtown' },
+  KDFW: { transit: 'DART Orange Line to downtown (~50 min)',     rideshare: 'Uber ~$35–55 to Dallas' },
+  KLAS: { transit: '(none worth it from LAS)',                    rideshare: 'Uber ~$15–25 to the Strip' },
+  KMSP: { transit: 'Light Rail Blue Line to downtown',            rideshare: 'Uber ~$25–40 downtown' },
+  KDEN: { transit: 'A Line train to Union Station (37 min)',      rideshare: 'Uber ~$45–65 to Denver' },
+  KPHX: { transit: 'Sky Train + Light Rail',                       rideshare: 'Uber ~$20–35 to Phoenix' },
+  KPHL: { transit: 'SEPTA Airport Line to Center City (~25 min)', rideshare: 'Uber ~$25–35 to Center City' },
+  KSAN: { transit: 'MTS Trolley extension to downtown',            rideshare: 'Uber ~$20–30 to downtown' },
+  CYYZ: { transit: 'UP Express to Union Station (25 min)',         rideshare: 'Uber ~$60–80 CAD downtown' },
+  CYUL: { transit: 'REM train (new) — fast to downtown',           rideshare: 'Uber ~$40–55 CAD downtown' },
+  CYVR: { transit: 'Canada Line SkyTrain to downtown (~26 min)',   rideshare: 'Uber ~$30–45 CAD downtown' },
+  MMMX: { transit: 'Metro Line 5 (basic) — Metrobús cleaner',      rideshare: 'Uber works very well in CDMX' },
+
+  // Europe
+  EGLL: { transit: 'Elizabeth Line or Heathrow Express',          rideshare: '£60–90 in an Uber to central' },
+  EGKK: { transit: 'Gatwick Express to Victoria (30 min)',         rideshare: '£70–100 to central London' },
+  EGCC: { transit: 'Train direct to Manchester Piccadilly',         rideshare: '£20–30 to city centre' },
+  LFPG: { transit: 'RER B straight into Paris',                     rideshare: '€55–75 fixed fare to right bank' },
+  EDDF: { transit: 'S-Bahn S8/S9 — Hauptbahnhof in 12 min',         rideshare: '€30–45 taxi to centre' },
+  EHAM: { transit: 'Train direct to Amsterdam Centraal (15 min)',   rideshare: '€40–55 Uber to centre' },
+  LIRF: { transit: 'Leonardo Express to Termini (32 min)',          rideshare: '€50 fixed taxi to centre' },
+  LEMD: { transit: 'Metro Line 8 to Nuevos Ministerios (20 min)',   rideshare: '€30 fixed taxi to centre' },
+  LSZH: { transit: 'Train to Hauptbahnhof — 12 min, every 10 min',  rideshare: 'CHF 60–80 to centre' },
+  LOWW: { transit: 'CAT (16 min) or S7 (cheaper, 25 min)',          rideshare: '€35–45 to centre' },
+  ESSA: { transit: 'Arlanda Express to Central (18 min)',           rideshare: 'SEK 500–650 to centre' },
+  EKCH: { transit: 'Metro M2 — runs 24/7, 13 min to centre',         rideshare: 'DKK 250–350 taxi to centre' },
+  LEBL: { transit: 'L9 Sud metro or Aerobús to plaça Catalunya',     rideshare: '€30–40 to centre' },
+  EDDM: { transit: 'S-Bahn S1/S8 to Hauptbahnhof (~40 min)',         rideshare: '€60–80 to centre' },
+
+  // Asia / Pacific
+  RJTT: { transit: 'Keikyu Line to Shinagawa, then JR',              rideshare: '¥6000–9000 taxi — train is way better' },
+  RJAA: { transit: "Narita Express (N'EX) or Skyliner",              rideshare: '¥20000+ taxi — please take the train' },
+  ZBAA: { transit: 'Airport Express to Dongzhimen',                  rideshare: 'Didi works, traffic dependent' },
+  ZSPD: { transit: 'Maglev + Metro 2 — actually fast and fun',       rideshare: 'Didi, but Maglev is iconic' },
+  RKSI: { transit: 'AREX express to Seoul Station (43 min)',         rideshare: 'Limousine bus is the rideshare alternative' },
+  WSSS: { transit: 'MRT to anywhere in the city',                     rideshare: 'Grab is excellent here' },
+  VHHH: { transit: 'Airport Express to Central — 24 min',             rideshare: 'Taxi or Uber, traffic in tunnels' },
+  VTBS: { transit: 'Airport Rail Link to Phaya Thai',                 rideshare: 'Grab/Bolt, traffic-permitting' },
+  VABB: { transit: '(Mumbai Metro line under construction)',          rideshare: 'Uber/Ola or pre-paid taxi' },
+  VIDP: { transit: 'Airport Express Metro to New Delhi (22 min)',     rideshare: 'Uber/Ola' },
+  VOMM: { transit: 'Suburban rail or Metro extension',                rideshare: 'Uber/Ola is most reliable' },
+  VOBL: { transit: 'Vayu Vajra (BMTC bus) — slower but cheap',         rideshare: 'Uber/Ola — traffic is the wildcard' },
+  VOHS: { transit: 'Pushpak bus or Metro feeder',                      rideshare: 'Uber/Ola is the easy option' },
+  YSSY: { transit: 'Airport Link train to Central (~13 min)',          rideshare: 'Uber AUD 50–70 to CBD' },
+  YMML: { transit: 'SkyBus to Southern Cross — every 10 min',          rideshare: 'Uber AUD 60–80 to CBD' },
+  NZAA: { transit: 'SkyBus to city — runs frequently',                 rideshare: 'Uber NZD 70–90 to CBD' },
+};
+
+/** Compose a transport-advice note based on time of day, weather, and the
+ *  arrival airport. Local time is approximated from longitude (good enough
+ *  for "rush hour or not"). */
+function transportNote({ icao, lat, lon, weather }) {
+  // Approximate destination local time from longitude
+  const offsetHours = Math.round(lon / 15);
+  const utcNow      = new Date();
+  const localHour   = (utcNow.getUTCHours() + offsetHours + 24) % 24;
+  const day         = (utcNow.getUTCDay() + (utcNow.getUTCHours() + offsetHours >= 24 ? 1 : 0)) % 7;
+  const isWeekend   = day === 0 || day === 6;
+
+  let period;
+  if      (localHour < 5)  period = 'late-night';
+  else if (localHour < 9)  period = 'morning';
+  else if (localHour < 12) period = 'midday';
+  else if (localHour < 17) period = 'afternoon';
+  else if (localHour < 20) period = 'evening';
+  else                      period = 'late-evening';
+
+  const isRushHour = !isWeekend && (
+    (localHour >= 7 && localHour <= 9) ||
+    (localHour >= 16 && localHour <= 19)
+  );
+
+  const weatherCode = weather && typeof weather.weather_code === 'number' ? weather.weather_code : null;
+  const isRain  = weatherCode != null && (
+    (weatherCode >= 51 && weatherCode <= 67) ||
+    (weatherCode >= 80 && weatherCode <= 82)
+  );
+  const isSnow  = weatherCode != null && (
+    (weatherCode >= 71 && weatherCode <= 77) ||
+    (weatherCode >= 85 && weatherCode <= 86)
+  );
+  const isStorm = weatherCode != null && weatherCode >= 95;
+
+  const known = AIRPORT_TRANSIT[icao];
+  let opening = '';
+  if      (period === 'late-night')   opening = 'Late-night arrival';
+  else if (period === 'late-evening') opening = 'Evening arrival';
+  else if (isRushHour)                opening = `${period} rush hour`;
+  else if (period === 'morning')      opening = 'Morning arrival';
+  else if (period === 'midday')       opening = 'Midday arrival';
+  else if (period === 'afternoon')    opening = 'Afternoon arrival';
+  else                                opening = 'Arriving';
+
+  let rec;
+  if (known) {
+    if (isRushHour && known.transit && known.transit[0] !== '(') {
+      rec = `take the ${known.transit.toLowerCase()}, it'll beat the traffic`;
+    } else if (period === 'late-night' || period === 'late-evening') {
+      rec = `${known.rideshare.toLowerCase()} is probably the easiest at this hour`;
+    } else if (isRain || isSnow || isStorm) {
+      rec = `the ${known.transit.toLowerCase()} keeps her dry, otherwise ${known.rideshare.toLowerCase()}`;
+    } else {
+      rec = `${known.transit.toLowerCase()} or ${known.rideshare.toLowerCase()} both work`;
+    }
+  } else {
+    if (isRushHour) {
+      rec = "give the road extra time, or look for an airport train if there is one";
+    } else if (period === 'late-night') {
+      rec = 'a rideshare is the safe bet at this hour';
+    } else if (isRain || isSnow || isStorm) {
+      rec = 'covered transit beats waiting for a cab in this weather';
+    } else {
+      rec = 'should be a smooth ride home';
+    }
+  }
+
+  return `${opening} — ${rec}.`;
+}
+
+/** Cute formatter for local-time line shown in the arrival card header. */
+function formatLocalTime(lat, lon) {
+  const offsetHours = Math.round(lon / 15);
+  const utcNow = new Date();
+  const localMs = utcNow.getTime() + offsetHours * 3600 * 1000;
+  const local   = new Date(localMs);
+  // We use UTC getters because we already added the offset
+  const hh = local.getUTCHours().toString().padStart(2, '0');
+  const mm = local.getUTCMinutes().toString().padStart(2, '0');
+  const sign = offsetHours >= 0 ? '+' : '';
+  return `local time ${hh}:${mm} (UTC${sign}${offsetHours})`;
+}
+
+/** Pull weather, render it + the transport note into the arrival card.
+ *  Called once when route is established and again every 10 minutes via
+ *  state.weatherTimer. Hides the card if there's no destination. */
+async function refreshArrivalCard() {
+  const route = state.currentRoute;
+  if (!route || !route.to || route.to.lat == null || route.to.lon == null) {
+    if (els.arrivalCard) els.arrivalCard.hidden = true;
+    return;
+  }
+  const dest = route.to;
+  els.arrivalCity.textContent      = dest.city || dest.name || (dest.iata || dest.icao || '—');
+  els.arrivalLocalTime.textContent = formatLocalTime(dest.lat, dest.lon);
+  els.arrivalCard.hidden = false;
+
+  // Fetch weather (Open-Meteo). On failure, hide the weather block but keep the card.
+  try {
+    const w = await fetchDestinationWeather(dest.lat, dest.lon);
+    if (!w) throw new Error('no weather data');
+    state.lastWeather = w;
+    const [label, glyph] = decodeWeather(w.weather_code, w.is_day);
+    els.weatherIcon.textContent = glyph;
+    els.weatherTemp.textContent = `${Math.round(w.temperature_2m)}°`;
+    els.weatherCond.textContent = label;
+    const pieces = [];
+    if (typeof w.apparent_temperature === 'number') pieces.push(`feels like ${Math.round(w.apparent_temperature)}°`);
+    if (typeof w.wind_speed_10m       === 'number') pieces.push(`wind ${Math.round(w.wind_speed_10m)} mph`);
+    els.weatherDetail.textContent = pieces.join(' · ');
+    els.weatherNote.textContent = whatToWear(
+      w.temperature_2m, w.weather_code, w.wind_speed_10m, CONFIG.partnerName
+    );
+  } catch (e) {
+    console.warn('[skyward] weather fetch failed:', e.message);
+    els.weatherIcon.textContent = '·';
+    els.weatherTemp.textContent = '—';
+    els.weatherCond.textContent = 'weather unavailable';
+    els.weatherDetail.textContent = '';
+    els.weatherNote.textContent = '';
+  }
+
+  // Transport advice (always available, uses last-known weather if any)
+  els.transportNote.textContent = transportNote({
+    icao:    dest.icao,
+    lat:     dest.lat,
+    lon:     dest.lon,
+    weather: state.lastWeather,
+  });
+}
+
 /** ac is an adsb.lol aircraft object. */
 function renderStats(ac, route) {
   const altFt    = numOrNull(ac.alt_geom) ?? numOrNull(ac.alt_baro);
@@ -994,7 +1289,10 @@ async function trackFlight(rawInput) {
   // Stop any in-flight animation/poll from the previous track
   stopAnimation();
   if (state.refreshTimer) { clearInterval(state.refreshTimer); state.refreshTimer = null; }
+  if (state.weatherTimer) { clearInterval(state.weatherTimer); state.weatherTimer = null; }
   state.lastFix = null;
+  state.lastWeather = null;
+  if (els.arrivalCard) els.arrivalCard.hidden = true;
 
   const candidates = flightToCallsigns(flight);
   if (!candidates.length) {
@@ -1076,6 +1374,11 @@ async function trackFlight(rawInput) {
   applyAircraftUpdate(aircraft);
   startAnimation();
   state.refreshTimer = setInterval(refreshLivePosition, CONFIG.refreshMs);
+
+  // Pull weather + transport for the destination once now, then on a slow
+  // 10-minute cadence (Open-Meteo updates roughly every 15 min anyway).
+  refreshArrivalCard();
+  state.weatherTimer = setInterval(refreshArrivalCard, CONFIG.weatherRefreshMs);
 }
 
 /* ─────────────────────────────────────────
@@ -1105,7 +1408,7 @@ function renderFromFix() {
   const fix = state.lastFix;
   if (!fix) return;
 
-  // Project the plane forward from its last real fix
+  // Step 1: dead-reckon the plane forward from its last real fix
   let curLat = fix.lat, curLon = fix.lon;
   if (fix.speedKt != null && fix.speedKt > 30 && fix.headingDeg != null) {
     const elapsedSec = (Date.now() - fix.time) / 1000;
@@ -1116,18 +1419,51 @@ function renderFromFix() {
     }
   }
 
-  renderPlane(curLat, curLon, fix.headingDeg);
+  // Keep the actual position so renderStats has truthful flown/remaining math
+  const actualLat = curLat, actualLon = curLon;
 
-  if (state.currentRoute && state.currentRoute.from) {
-    renderFlownPath(state.currentRoute.from, curLat, curLon);
+  // Step 2: when we have a route, snap the plane onto the dashed great-circle
+  // line so the visual stays clean — one path, plane gliding along it. Heading
+  // becomes the path's tangent at that point so the icon points correctly.
+  let displayHeading = fix.headingDeg;
+  if (state.currentRoute && state.currentRoute.from && state.currentRoute.to) {
+    const snap = snapToRoute(state.currentRoute, actualLat, actualLon);
+    if (snap) {
+      curLat = snap.lat;
+      curLon = snap.lon;
+      if (snap.bearing != null) displayHeading = snap.bearing;
+    }
   }
 
-  // Hand renderStats a synthetic aircraft with the interpolated position so
-  // ETA, progress, distance flown, love-note, and label timing all tick live.
-  const synthetic = { ...fix.raw, lat: curLat, lon: curLon };
+  renderPlane(curLat, curLon, displayHeading);
+
+  // No solid flown line anymore — just the dashed route + the moving plane.
+
+  // renderStats uses the *actual* (not snapped) position for accurate progress
+  const synthetic = { ...fix.raw, lat: actualLat, lon: actualLon };
   renderStats(synthetic, state.currentRoute);
 
   setUpdated((Date.now() - fix.time) / 1000);
+}
+
+/** Map an aircraft's actual lat/lon to a point along the great-circle route
+ *  from origin to destination, based on flown-distance ratio. Also returns
+ *  the path's bearing at that point so the plane icon can be oriented along
+ *  the line rather than at its raw heading. */
+function snapToRoute(route, lat, lon) {
+  const totalKm = haversineKm(route.from.lat, route.from.lon, route.to.lat, route.to.lon);
+  if (totalKm <= 0) return null;
+  const flownKm = haversineKm(route.from.lat, route.from.lon, lat, lon);
+  const ratio   = Math.min(1, Math.max(0, flownKm / totalKm));
+
+  const path = greatCirclePath(route.from.lat, route.from.lon,
+                               route.to.lat,   route.to.lon, 256);
+  const idx   = Math.min(path.length - 1, Math.floor(ratio * (path.length - 1)));
+  const here  = path[idx];
+  const next  = path[Math.min(idx + 1, path.length - 1)];
+
+  const bearing = (here !== next) ? bearingDeg(here[0], here[1], next[0], next[1]) : null;
+  return { lat: here[0], lon: here[1], bearing };
 }
 
 function startAnimation() {

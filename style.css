@@ -794,6 +794,122 @@ body {
   font-style: italic;
 }
 
+/* ───────── Arrival card (weather + transport) ───────── */
+.arrival-card {
+  padding: 24px 22px 22px;
+  border-radius: var(--radius);
+  background: linear-gradient(160deg, rgba(244, 207, 148, 0.05) 0%, rgba(255, 122, 122, 0.04) 50%, rgba(11, 17, 38, 0.5) 100%);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(20px);
+  position: relative;
+  overflow: hidden;
+}
+.arrival-card::before {
+  /* faint star sparkle in the upper-right corner */
+  content: '✦';
+  position: absolute;
+  top: 14px;
+  right: 18px;
+  color: var(--gold-soft);
+  font-size: 14px;
+  opacity: 0.35;
+}
+
+.arrival-header {
+  margin-bottom: 18px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+.arrival-eyebrow {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--paper-faint);
+  margin-bottom: 4px;
+}
+.arrival-city {
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 26px;
+  line-height: 1.1;
+  color: var(--coral);
+  letter-spacing: 0.2px;
+  margin-bottom: 4px;
+}
+.arrival-localtime {
+  font-size: 12px;
+  color: var(--paper-mute);
+  font-style: italic;
+}
+
+.arrival-section {
+  padding: 14px 0;
+}
+.arrival-section + .arrival-section {
+  border-top: 1px solid var(--line);
+  margin-top: 6px;
+}
+.arrival-section-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.arrival-section-title {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--paper-faint);
+}
+.weather-icon {
+  font-size: 20px;
+  line-height: 1;
+  filter: drop-shadow(0 0 8px var(--gold-soft));
+}
+
+.weather-row {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+.weather-temp {
+  font-family: var(--serif);
+  font-size: 38px;
+  line-height: 1;
+  color: var(--paper);
+  letter-spacing: -1px;
+}
+.weather-meta {
+  flex: 1;
+  min-width: 0;
+}
+.weather-cond {
+  font-size: 14px;
+  color: var(--paper);
+  margin-bottom: 2px;
+}
+.weather-detail {
+  font-size: 11px;
+  color: var(--paper-faint);
+  font-family: var(--mono);
+  letter-spacing: 0.05em;
+}
+
+.cute-note {
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--paper-mute);
+  padding: 10px 14px;
+  background: rgba(243, 236, 224, 0.03);
+  border-left: 2px solid var(--gold);
+  border-radius: 0 8px 8px 0;
+}
+
 /* ───────── State messages ───────── */
 .state-msg {
   max-width: 600px; margin: 80px auto;

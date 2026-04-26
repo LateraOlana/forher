@@ -167,6 +167,38 @@
           <div class="eta-value" id="etaValue">—</div>
           <div class="eta-sub" id="etaSub">—</div>
         </div>
+
+        <!-- "When she lands" — weather + transport for the destination -->
+        <div class="arrival-card" id="arrivalCard" hidden>
+          <div class="arrival-header">
+            <div class="arrival-eyebrow">When she lands in</div>
+            <div class="arrival-city" id="arrivalCity">—</div>
+            <div class="arrival-localtime" id="arrivalLocalTime">—</div>
+          </div>
+
+          <div class="arrival-section">
+            <div class="arrival-section-head">
+              <span class="weather-icon" id="weatherIcon">·</span>
+              <div class="arrival-section-title">Weather there</div>
+            </div>
+            <div class="weather-row">
+              <div class="weather-temp" id="weatherTemp">—</div>
+              <div class="weather-meta">
+                <div class="weather-cond" id="weatherCond">—</div>
+                <div class="weather-detail" id="weatherDetail">—</div>
+              </div>
+            </div>
+            <div class="cute-note" id="weatherNote">—</div>
+          </div>
+
+          <div class="arrival-section">
+            <div class="arrival-section-head">
+              <span class="weather-icon">⊹</span>
+              <div class="arrival-section-title">Getting around</div>
+            </div>
+            <div class="cute-note" id="transportNote">—</div>
+          </div>
+        </div>
       </aside>
     </div>
   </section>
@@ -190,7 +222,7 @@
 
   <!-- ───────── Footer ───────── -->
   <footer class="site-footer">
-    <p>Built with care · Live data from <a href="https://adsb.lol/" target="_blank" rel="noopener">ADSB.lol</a> · Routes from <a href="https://hexdb.io/" target="_blank" rel="noopener">hexdb.io</a> · Maps © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a></p>
+    <p>Built with care · Flight data from <a href="https://adsb.lol/" target="_blank" rel="noopener">ADSB.lol</a> · Weather from <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> · Maps © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a></p>
     <p class="footer-quiet">Safe travels, Norma. Always.</p>
   </footer>
 
