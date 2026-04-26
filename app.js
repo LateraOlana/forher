@@ -13,6 +13,10 @@
 const CONFIG = {
   adsbBase:   'https://api.adsb.lol/v2',
   hexdbBase:  'https://hexdb.io/api/v1',
+  // Public CORS proxy. Browser security blocks direct fetch from a github.io
+  // origin to most third-party APIs, so we route through corsproxy.io which
+  // adds the Access-Control-Allow-Origin header for us. Free, no signup.
+  corsProxy:  'https://corsproxy.io/?url=',
   refreshMs:  30_000,                  // re-poll live position every 30s
   storageKey: 'skyward.v2',
   partnerName: 'Norma',
@@ -465,12 +469,34 @@ function numOrNull(v) { return (typeof v === 'number' && isFinite(v)) ? v : null
 /* ─────────────────────────────────────────
    API — adsb.lol: live aircraft by callsign
    ───────────────────────────────────────── */
+
+// Wraps fetch through a CORS proxy so static-site requests survive browser
+// same-origin enforcement. Tries direct first (some browsers/extensions may
+// allow it), falls back to the proxy on network failure. Logs everything to
+// the console so issues are diagnosable from devtools.
+async function corsFetch(targetUrl) {
+  // Attempt direct first — saves a hop when CORS happens to be open.
+  try {
+    const direct = await fetch(targetUrl, { headers: { 'Accept': 'application/json' } });
+    if (direct.ok) return direct;
+    console.warn('[skyward] direct fetch returned', direct.status, 'for', targetUrl, '— retrying via proxy');
+  } catch (e) {
+    console.warn('[skyward] direct fetch failed for', targetUrl, '—', e.message, '— retrying via proxy');
+  }
+  // Fall back through corsproxy.io
+  const proxied = CONFIG.corsProxy + encodeURIComponent(targetUrl);
+  const res = await fetch(proxied, { headers: { 'Accept': 'application/json' } });
+  if (!res.ok) throw new Error(`proxy ${res.status} for ${targetUrl}`);
+  return res;
+}
+
 async function fetchAircraftByCallsign(callsign) {
   const url = `${CONFIG.adsbBase}/callsign/${encodeURIComponent(callsign)}`;
-  const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
-  if (!res.ok) throw new Error(`adsb.lol returned ${res.status}`);
+  console.log('[skyward] fetching aircraft for callsign', callsign);
+  const res = await corsFetch(url);
   const data = await res.json();
   const list = (data && data.ac) || [];
+  console.log('[skyward] adsb.lol returned', list.length, 'aircraft for', callsign);
   if (!list.length) return null;
 
   const target = callsign.trim().toUpperCase();
@@ -487,14 +513,14 @@ async function fetchRouteByCallsign(callsign) {
     const cs = (callsign || '').trim();
     if (!cs) return null;
     const url = `${CONFIG.hexdbBase}/route/icao/${encodeURIComponent(cs)}`;
-    const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
-    if (!res.ok) return null;
+    const res = await corsFetch(url);
     const data = await res.json();
     if (!data || !data.route) return null;
     const parts = String(data.route).split('-').map(s => s.trim()).filter(Boolean);
     if (parts.length < 2) return null;
     return { fromIcao: parts[0], toIcao: parts[parts.length - 1] };
-  } catch {
+  } catch (e) {
+    console.warn('[skyward] route lookup failed:', e.message);
     return null;
   }
 }
@@ -718,9 +744,9 @@ async function trackFlight(rawInput) {
 
   if (!aircraft) {
     if (lastErr) {
-      console.error(lastErr);
+      console.error('[skyward] all callsign lookups failed:', lastErr);
       showError('Radar is offline right now.',
-                "Couldn't reach the live tracking network. Try again in a minute.");
+                "Couldn't reach the live tracking network. Try again in a minute. (Open the browser console for details.)");
     } else {
       showError(`Couldn't find ${flight} in the air right now.`,
                 "She might be on the ground, just landed, or outside our radar window. Try again in a few minutes.");
