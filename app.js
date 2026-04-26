@@ -437,6 +437,10 @@ function flightToCallsigns(flight) {
 
 /** Great-circle interpolation between two lat/lon points. */
 function greatCirclePath(lat1, lon1, lat2, lon2, n = 128) {
+  if (!Number.isFinite(lat1) || !Number.isFinite(lon1) ||
+      !Number.isFinite(lat2) || !Number.isFinite(lon2)) {
+    return [[lat1 || 0, lon1 || 0], [lat2 || 0, lon2 || 0]];
+  }
   const toRad = (d) => d * Math.PI / 180;
   const toDeg = (r) => r * 180 / Math.PI;
   const φ1 = toRad(lat1), λ1 = toRad(lon1);
@@ -445,7 +449,7 @@ function greatCirclePath(lat1, lon1, lat2, lon2, n = 128) {
     Math.sin(φ1) * Math.sin(φ2) +
     Math.cos(φ1) * Math.cos(φ2) * Math.cos(λ2 - λ1)
   )));
-  if (Δσ === 0) return [[lat1, lon1], [lat2, lon2]];
+  if (!Number.isFinite(Δσ) || Δσ === 0) return [[lat1, lon1], [lat2, lon2]];
   const points = [];
   for (let i = 0; i <= n; i++) {
     const f = i / n;
@@ -456,35 +460,48 @@ function greatCirclePath(lat1, lon1, lat2, lon2, n = 128) {
     const z = A * Math.sin(φ1) + B * Math.sin(φ2);
     const φ = Math.atan2(z, Math.sqrt(x * x + y * y));
     const λ = Math.atan2(y, x);
-    points.push([toDeg(φ), toDeg(λ)]);
+    const lat = toDeg(φ), lon = toDeg(λ);
+    if (Number.isFinite(lat) && Number.isFinite(lon)) {
+      points.push([lat, lon]);
+    }
   }
-  return points;
+  return points.length ? points : [[lat1, lon1], [lat2, lon2]];
 }
 
 /** Distance in km between two lat/lon points (haversine). */
 function haversineKm(lat1, lon1, lat2, lon2) {
+  if (!Number.isFinite(lat1) || !Number.isFinite(lon1) ||
+      !Number.isFinite(lat2) || !Number.isFinite(lon2)) return 0;
   const R = 6371;
   const toRad = (d) => d * Math.PI / 180;
   const dφ = toRad(lat2 - lat1);
   const dλ = toRad(lon2 - lon1);
   const a = Math.sin(dφ / 2) ** 2
           + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dλ / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(a));
+  const result = 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+  return Number.isFinite(result) ? result : 0;
 }
 
 /** Initial bearing in degrees (0–360) along the great circle from p1 to p2. */
 function bearingDeg(lat1, lon1, lat2, lon2) {
+  if (!Number.isFinite(lat1) || !Number.isFinite(lon1) ||
+      !Number.isFinite(lat2) || !Number.isFinite(lon2)) return 0;
   const φ1 = lat1 * Math.PI / 180;
   const φ2 = lat2 * Math.PI / 180;
   const Δλ = (lon2 - lon1) * Math.PI / 180;
   const y  = Math.sin(Δλ) * Math.cos(φ2);
   const x  = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
-  return ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
+  const deg = ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
+  return Number.isFinite(deg) ? deg : 0;
 }
 
 /** Project a starting point along an initial bearing for distanceKm.
  *  Used for dead-reckoning the plane's position between API polls. */
 function projectByBearing(lat, lon, bearingDegrees, distanceKm) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) ||
+      !Number.isFinite(bearingDegrees) || !Number.isFinite(distanceKm)) {
+    return [lat, lon];
+  }
   const R  = 6371;
   const δ  = distanceKm / R;
   const θ  = bearingDegrees * Math.PI / 180;
@@ -495,7 +512,12 @@ function projectByBearing(lat, lon, bearingDegrees, distanceKm) {
     Math.sin(θ) * Math.sin(δ) * Math.cos(φ1),
     Math.cos(δ) - Math.sin(φ1) * Math.sin(φ2)
   );
-  return [φ2 * 180 / Math.PI, ((λ2 * 180 / Math.PI + 540) % 360) - 180];
+  const outLat = φ2 * 180 / Math.PI;
+  const outLon = ((λ2 * 180 / Math.PI + 540) % 360) - 180;
+  return [
+    Number.isFinite(outLat) ? outLat : lat,
+    Number.isFinite(outLon) ? outLon : lon,
+  ];
 }
 
 const fmt = (n) => Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
@@ -509,13 +531,17 @@ function formatRelative(secsAgo) {
 }
 function setUpdated(secsAgo) {
   if (secsAgo == null || !isFinite(secsAgo)) { els.lastUpdated.textContent = '—'; return; }
-  // Append the route source (adsb.lol / adsbdb / hexdb) so the user can see
-  // at a glance which database produced the displayed origin & destination.
-  const src = state.currentRoute && state.currentRoute.source;
-  const tag = src ? ` · route: ${src}` : '';
-  els.lastUpdated.textContent = `updated ${formatRelative(secsAgo)}${tag}`;
+  els.lastUpdated.textContent = `updated ${formatRelative(secsAgo)}`;
 }
 function numOrNull(v) { return (typeof v === 'number' && isFinite(v)) ? v : null; }
+/** Sanity-check a lat/lon pair. Rejects NaN/Infinity/non-numbers AND the
+ *  classic "null island" (0, 0) which often signals untracked aircraft. */
+function validCoord(lat, lon) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon))    return false;
+  if (Math.abs(lat) > 90 || Math.abs(lon) > 180)         return false;
+  if (lat === 0 && lon === 0)                            return false;
+  return true;
+}
 
 /* ─────────────────────────────────────────
    API — adsb.lol: live aircraft by callsign
@@ -576,7 +602,7 @@ async function fetchAircraftListByCallsign(callsign) {
   console.log('[skyward] adsb.lol returned', list.length, 'aircraft for', callsign);
   if (!list.length) return [];
 
-  const withPos = list.filter(a => a.lat != null && a.lon != null);
+  const withPos = list.filter(a => validCoord(a.lat, a.lon));
   if (!withPos.length) return [];
 
   const target = callsign.trim().toUpperCase();
@@ -622,25 +648,17 @@ function pickBestAircraft(list, route) {
 
 /* ─────────────────────────────────────────
    API — route lookup
-   Primary: adsb.lol's own /api/0/routeset endpoint. This is the SAME source
-   adsb.lol's own website uses, so origin/destination will match what the
-   user sees there. It accepts the plane's current location and returns a
-   `plausible` boolean that flags route data that doesn't fit the actual
-   aircraft position — letting us reject stale matches before drawing them.
-   Fallbacks: adsbdb.com, then hexdb.io.
-   Returns { from, to } airport pair or null.
+   Single source: adsb.lol's /api/0/routeset endpoint. This is the same data
+   adsb.lol's website uses, so what we display will match what the user sees
+   there. We deliberately do NOT fall back to other databases — they don't
+   agree with adsb.lol and that's the cause of the wrong routes the user has
+   been seeing. Better to show no route than the wrong route.
+   Returns { from, to, source, plausible } or null.
    ───────────────────────────────────────── */
 async function fetchRouteByCallsign(callsign, lat = 0, lon = 0) {
   const cs = (callsign || '').trim();
   if (!cs) return null;
 
-  // ── PRIMARY: adsb.lol routeset.
-  // This is the same database adsb.lol's own website uses. Whatever it
-  // returns IS the canonical answer for "what does adsb.lol show for this
-  // flight." We use it unconditionally — even when plausible:false — because
-  // the website also displays it in those cases, and the user is comparing
-  // against the website. The plausible flag is logged for diagnostic purposes
-  // but does NOT gate display.
   try {
     const url  = `${CONFIG.adsbBase.replace(/\/v2$/, '')}/api/0/routeset`;
     const body = JSON.stringify({ planes: [{ callsign: cs, lat, lng: lon }] });
@@ -649,68 +667,29 @@ async function fetchRouteByCallsign(callsign, lat = 0, lon = 0) {
     const data = await res.json();
     console.log('[skyward] adsb.lol routeset raw response:', JSON.stringify(data));
     const entry = Array.isArray(data) ? data[0] : null;
-    if (entry && Array.isArray(entry._airports) && entry._airports.length >= 2) {
-      const origin = entry._airports[0];
-      const dest   = entry._airports[entry._airports.length - 1];
-      console.log(`[skyward] ✓ route from adsb.lol: ${origin.iata} (${origin.location}) → ${dest.iata} (${dest.location}) [plausible=${entry.plausible}]`);
-      return {
-        from:      airportFromAdsblol(origin),
-        to:        airportFromAdsblol(dest),
-        source:    'adsb.lol',
-        plausible: entry.plausible !== false,
-      };
+    if (!entry || !Array.isArray(entry._airports) || entry._airports.length < 2) {
+      console.warn('[skyward] adsb.lol has no route data for', cs, '— showing live position only');
+      return null;
     }
-    console.log('[skyward] adsb.lol returned no airport data — trying fallbacks');
-  } catch (e) {
-    console.warn('[skyward] adsb.lol routeset failed:', e.message, '— trying fallbacks');
-  }
-
-  // ── FALLBACK 1: adsbdb.com (when adsb.lol returns nothing) ──
-  try {
-    const url  = `${CONFIG.adsbdbBase}/callsign/${encodeURIComponent(cs)}`;
-    const res  = await corsFetch(url);
-    const data = await res.json();
-    const fr   = data && data.response && data.response.flightroute;
-    if (fr && fr.origin && fr.destination &&
-        typeof fr.origin.latitude === 'number' && typeof fr.origin.longitude === 'number' &&
-        typeof fr.destination.latitude === 'number' && typeof fr.destination.longitude === 'number') {
-      console.log(`[skyward] ✓ route from adsbdb (fallback): ${fr.origin.iata_code} (${fr.origin.municipality}) → ${fr.destination.iata_code} (${fr.destination.municipality})`);
-      return {
-        from:   airportFromAdsbdb(fr.origin),
-        to:     airportFromAdsbdb(fr.destination),
-        source: 'adsbdb',
-      };
+    const origin = entry._airports[0];
+    const dest   = entry._airports[entry._airports.length - 1];
+    // Validate coordinates before trusting the data — bad coords would
+    // crash Leaflet or produce NaN throughout the route math.
+    if (!validCoord(origin.lat, origin.lon) || !validCoord(dest.lat, dest.lon)) {
+      console.warn('[skyward] adsb.lol returned invalid coordinates — discarding route');
+      return null;
     }
+    console.log(`[skyward] ✓ route: ${origin.iata} (${origin.location}) → ${dest.iata} (${dest.location}) [plausible=${entry.plausible}]`);
+    return {
+      from:      airportFromAdsblol(origin),
+      to:        airportFromAdsblol(dest),
+      source:    'adsb.lol',
+      plausible: entry.plausible !== false,
+    };
   } catch (e) {
-    console.warn('[skyward] adsbdb route lookup failed:', e.message);
+    console.warn('[skyward] adsb.lol routeset failed:', e.message);
+    return null;
   }
-
-  // ── FALLBACK 2: hexdb.io (last resort) ──
-  try {
-    const url  = `${CONFIG.hexdbBase}/route/icao/${encodeURIComponent(cs)}`;
-    const res  = await corsFetch(url);
-    const data = await res.json();
-    if (data && data.route) {
-      const parts = String(data.route).split('-').map(s => s.trim()).filter(Boolean);
-      if (parts.length >= 2) {
-        const fromAp = AIRPORTS[parts[0]];
-        const toAp   = AIRPORTS[parts[parts.length - 1]];
-        if (fromAp && toAp) {
-          console.log(`[skyward] ✓ route from hexdb (last-resort fallback): ${fromAp.iata} → ${toAp.iata}`);
-          return {
-            from:   { ...fromAp, icao: parts[0] },
-            to:     { ...toAp,   icao: parts[parts.length - 1] },
-            source: 'hexdb',
-          };
-        }
-      }
-    }
-  } catch (e) {
-    console.warn('[skyward] hexdb route lookup failed:', e.message);
-  }
-
-  console.warn('[skyward] no route data available for', cs, 'from any source');
-  return null;
 }
 
 // Normalize an adsb.lol routeset airport entry into our standard airport shape
@@ -792,6 +771,13 @@ function planeIcon(headingDeg) {
    Render: route, plane, stats
    ───────────────────────────────────────── */
 function renderRoute(from, to, timing) {
+  if (!from || !to ||
+      !validCoord(from.lat, from.lon) ||
+      !validCoord(to.lat,   to.lon)) {
+    console.warn('[skyward] renderRoute called with invalid coordinates — skipping');
+    return;
+  }
+
   const path = greatCirclePath(from.lat, from.lon, to.lat, to.lon, 128);
   state.routeLayer = L.polyline(path, {
     color: '#e9b872', weight: 2, opacity: 0.55,
@@ -855,6 +841,7 @@ function renderFlownPath(from, currentLat, currentLon) {
 }
 
 function renderPlane(lat, lon, heading) {
+  if (!validCoord(lat, lon)) return;
   if (state.planeMarker) {
     state.planeMarker.setLatLng([lat, lon]);
     state.planeMarker.setIcon(planeIcon(heading));
@@ -867,11 +854,11 @@ function renderPlane(lat, lon, heading) {
 
 function fitMapToFlight(from, to, planeLat, planeLon) {
   const points = [];
-  if (from) points.push([from.lat, from.lon]);
-  if (to)   points.push([to.lat, to.lon]);
-  if (planeLat != null && planeLon != null) points.push([planeLat, planeLon]);
-  if (points.length === 1) state.map.setView(points[0], 6);
-  else if (points.length > 1) state.map.fitBounds(points, { padding: [60, 60], maxZoom: 7 });
+  if (from && validCoord(from.lat, from.lon)) points.push([from.lat, from.lon]);
+  if (to   && validCoord(to.lat,   to.lon))   points.push([to.lat,   to.lon]);
+  if (validCoord(planeLat, planeLon))         points.push([planeLat, planeLon]);
+  if (points.length === 1)      state.map.setView(points[0], 6);
+  else if (points.length > 1)   state.map.fitBounds(points, { padding: [60, 60], maxZoom: 7 });
 }
 
 /** Estimate departure & arrival times from current speed and progress.
@@ -1378,7 +1365,11 @@ async function trackFlight(rawInput) {
   // Pull weather + transport for the destination once now, then on a slow
   // 10-minute cadence (Open-Meteo updates roughly every 15 min anyway).
   refreshArrivalCard();
-  state.weatherTimer = setInterval(refreshArrivalCard, CONFIG.weatherRefreshMs);
+  state.weatherTimer = setInterval(() => {
+    refreshArrivalCard().catch(err => {
+      console.warn('[skyward] weather refresh tick threw — recovering:', err);
+    });
+  }, CONFIG.weatherRefreshMs);
 }
 
 /* ─────────────────────────────────────────
@@ -1451,24 +1442,42 @@ function renderFromFix() {
  *  the path's bearing at that point so the plane icon can be oriented along
  *  the line rather than at its raw heading. */
 function snapToRoute(route, lat, lon) {
+  if (!route || !route.from || !route.to) return null;
+  if (!validCoord(route.from.lat, route.from.lon) ||
+      !validCoord(route.to.lat,   route.to.lon)   ||
+      !validCoord(lat, lon)) return null;
+
   const totalKm = haversineKm(route.from.lat, route.from.lon, route.to.lat, route.to.lon);
-  if (totalKm <= 0) return null;
+  if (!totalKm || totalKm <= 0) return null;
   const flownKm = haversineKm(route.from.lat, route.from.lon, lat, lon);
   const ratio   = Math.min(1, Math.max(0, flownKm / totalKm));
+  if (!Number.isFinite(ratio)) return null;
 
   const path = greatCirclePath(route.from.lat, route.from.lon,
                                route.to.lat,   route.to.lon, 256);
-  const idx   = Math.min(path.length - 1, Math.floor(ratio * (path.length - 1)));
+  if (!path.length) return null;
+  const idx   = Math.min(path.length - 1, Math.max(0, Math.floor(ratio * (path.length - 1))));
   const here  = path[idx];
   const next  = path[Math.min(idx + 1, path.length - 1)];
+  if (!here || !validCoord(here[0], here[1])) return null;
 
-  const bearing = (here !== next) ? bearingDeg(here[0], here[1], next[0], next[1]) : null;
+  const bearing = (here !== next && next && validCoord(next[0], next[1]))
+    ? bearingDeg(here[0], here[1], next[0], next[1])
+    : null;
   return { lat: here[0], lon: here[1], bearing };
 }
 
 function startAnimation() {
   stopAnimation();
-  state.animationTimer = setInterval(renderFromFix, 1000);
+  // Wrap the tick so a thrown exception in one frame can't poison the
+  // setInterval and freeze the live update forever.
+  state.animationTimer = setInterval(() => {
+    try {
+      renderFromFix();
+    } catch (err) {
+      console.warn('[skyward] render tick threw — recovering:', err);
+    }
+  }, 1000);
 }
 function stopAnimation() {
   if (state.animationTimer) {
