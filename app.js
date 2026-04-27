@@ -16,12 +16,14 @@ const CONFIG = {
   hexdbBase:  'https://hexdb.io/api/v1',    // fallback route lookup
   weatherBase:'https://api.open-meteo.com/v1/forecast',  // weather at destination — free, no key
   // Public CORS proxies. We try each in order if direct browser fetch fails.
-  // Multiple options because POST behavior varies between proxies and any
-  // single proxy can rate-limit or go down.
+  // Ordered by reliability for POST requests — the route lookup uses POST and
+  // some proxies silently strip POST bodies. allorigins handles POST cleanly,
+  // codetabs is solid, corsproxy.io is fastest for GET but can mangle POST.
   corsProxies: [
-    url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
-    url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
     url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+    url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+    url => `https://thingproxy.freeboard.io/fetch/${url}`,
   ],
   refreshMs:        30_000,                // re-poll live position every 30s
   weatherRefreshMs: 10 * 60_000,           // weather every 10 min
@@ -437,6 +439,10 @@ function flightToCallsigns(flight) {
 
 /** Great-circle interpolation between two lat/lon points. */
 function greatCirclePath(lat1, lon1, lat2, lon2, n = 128) {
+  if (!Number.isFinite(lat1) || !Number.isFinite(lon1) ||
+      !Number.isFinite(lat2) || !Number.isFinite(lon2)) {
+    return [[lat1 || 0, lon1 || 0], [lat2 || 0, lon2 || 0]];
+  }
   const toRad = (d) => d * Math.PI / 180;
   const toDeg = (r) => r * 180 / Math.PI;
   const φ1 = toRad(lat1), λ1 = toRad(lon1);
@@ -445,7 +451,7 @@ function greatCirclePath(lat1, lon1, lat2, lon2, n = 128) {
     Math.sin(φ1) * Math.sin(φ2) +
     Math.cos(φ1) * Math.cos(φ2) * Math.cos(λ2 - λ1)
   )));
-  if (Δσ === 0) return [[lat1, lon1], [lat2, lon2]];
+  if (!Number.isFinite(Δσ) || Δσ === 0) return [[lat1, lon1], [lat2, lon2]];
   const points = [];
   for (let i = 0; i <= n; i++) {
     const f = i / n;
@@ -456,35 +462,48 @@ function greatCirclePath(lat1, lon1, lat2, lon2, n = 128) {
     const z = A * Math.sin(φ1) + B * Math.sin(φ2);
     const φ = Math.atan2(z, Math.sqrt(x * x + y * y));
     const λ = Math.atan2(y, x);
-    points.push([toDeg(φ), toDeg(λ)]);
+    const lat = toDeg(φ), lon = toDeg(λ);
+    if (Number.isFinite(lat) && Number.isFinite(lon)) {
+      points.push([lat, lon]);
+    }
   }
-  return points;
+  return points.length ? points : [[lat1, lon1], [lat2, lon2]];
 }
 
 /** Distance in km between two lat/lon points (haversine). */
 function haversineKm(lat1, lon1, lat2, lon2) {
+  if (!Number.isFinite(lat1) || !Number.isFinite(lon1) ||
+      !Number.isFinite(lat2) || !Number.isFinite(lon2)) return 0;
   const R = 6371;
   const toRad = (d) => d * Math.PI / 180;
   const dφ = toRad(lat2 - lat1);
   const dλ = toRad(lon2 - lon1);
   const a = Math.sin(dφ / 2) ** 2
           + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dλ / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(a));
+  const result = 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+  return Number.isFinite(result) ? result : 0;
 }
 
 /** Initial bearing in degrees (0–360) along the great circle from p1 to p2. */
 function bearingDeg(lat1, lon1, lat2, lon2) {
+  if (!Number.isFinite(lat1) || !Number.isFinite(lon1) ||
+      !Number.isFinite(lat2) || !Number.isFinite(lon2)) return 0;
   const φ1 = lat1 * Math.PI / 180;
   const φ2 = lat2 * Math.PI / 180;
   const Δλ = (lon2 - lon1) * Math.PI / 180;
   const y  = Math.sin(Δλ) * Math.cos(φ2);
   const x  = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
-  return ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
+  const deg = ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
+  return Number.isFinite(deg) ? deg : 0;
 }
 
 /** Project a starting point along an initial bearing for distanceKm.
  *  Used for dead-reckoning the plane's position between API polls. */
 function projectByBearing(lat, lon, bearingDegrees, distanceKm) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) ||
+      !Number.isFinite(bearingDegrees) || !Number.isFinite(distanceKm)) {
+    return [lat, lon];
+  }
   const R  = 6371;
   const δ  = distanceKm / R;
   const θ  = bearingDegrees * Math.PI / 180;
@@ -495,7 +514,12 @@ function projectByBearing(lat, lon, bearingDegrees, distanceKm) {
     Math.sin(θ) * Math.sin(δ) * Math.cos(φ1),
     Math.cos(δ) - Math.sin(φ1) * Math.sin(φ2)
   );
-  return [φ2 * 180 / Math.PI, ((λ2 * 180 / Math.PI + 540) % 360) - 180];
+  const outLat = φ2 * 180 / Math.PI;
+  const outLon = ((λ2 * 180 / Math.PI + 540) % 360) - 180;
+  return [
+    Number.isFinite(outLat) ? outLat : lat,
+    Number.isFinite(outLon) ? outLon : lon,
+  ];
 }
 
 const fmt = (n) => Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
@@ -509,13 +533,17 @@ function formatRelative(secsAgo) {
 }
 function setUpdated(secsAgo) {
   if (secsAgo == null || !isFinite(secsAgo)) { els.lastUpdated.textContent = '—'; return; }
-  // Append the route source (adsb.lol / adsbdb / hexdb) so the user can see
-  // at a glance which database produced the displayed origin & destination.
-  const src = state.currentRoute && state.currentRoute.source;
-  const tag = src ? ` · route: ${src}` : '';
-  els.lastUpdated.textContent = `updated ${formatRelative(secsAgo)}${tag}`;
+  els.lastUpdated.textContent = `updated ${formatRelative(secsAgo)}`;
 }
 function numOrNull(v) { return (typeof v === 'number' && isFinite(v)) ? v : null; }
+/** Sanity-check a lat/lon pair. Rejects NaN/Infinity/non-numbers AND the
+ *  classic "null island" (0, 0) which often signals untracked aircraft. */
+function validCoord(lat, lon) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon))    return false;
+  if (Math.abs(lat) > 90 || Math.abs(lon) > 180)         return false;
+  if (lat === 0 && lon === 0)                            return false;
+  return true;
+}
 
 /* ─────────────────────────────────────────
    API — adsb.lol: live aircraft by callsign
@@ -524,6 +552,11 @@ function numOrNull(v) { return (typeof v === 'number' && isFinite(v)) ? v : null
 // Wraps fetch through CORS proxies so static-site requests survive browser
 // same-origin enforcement. Tries direct first, then walks a chain of public
 // proxies. Logs every attempt so failures are diagnosable from devtools.
+/** Wraps fetch through CORS proxies and returns PARSED JSON.
+ *  Critical detail: a proxy can return HTTP 200 with an empty or non-JSON
+ *  body when it fails to proxy POST properly. We must read+parse the body
+ *  inside the proxy loop so we can fall through to the next proxy on
+ *  empty/garbage responses, instead of returning a broken success. */
 async function corsFetch(targetUrl, options = {}) {
   const init = {
     method:  options.method  || 'GET',
@@ -534,30 +567,39 @@ async function corsFetch(targetUrl, options = {}) {
     init.headers['Content-Type'] = init.headers['Content-Type'] || 'application/json';
   }
 
+  const tryFetch = async (url, label) => {
+    const res = await fetch(url, init);
+    if (!res.ok) throw new Error(`${label} returned ${res.status}`);
+    const text = await res.text();
+    if (!text || !text.trim()) throw new Error(`${label} returned empty body`);
+    let data;
+    try { data = JSON.parse(text); }
+    catch (_) { throw new Error(`${label} returned non-JSON body`); }
+    return { data, text, response: res };
+  };
+
   // 1. Try direct (works if the API has open CORS for our origin)
   try {
-    const direct = await fetch(targetUrl, init);
-    if (direct.ok) return direct;
-    console.warn('[skyward] direct fetch returned', direct.status, 'for', targetUrl);
+    const result = await tryFetch(targetUrl, 'direct');
+    return result;
   } catch (e) {
     console.warn('[skyward] direct fetch failed for', targetUrl, '—', e.message);
   }
 
-  // 2. Walk the proxy chain. Bail out as soon as one succeeds.
+  // 2. Walk every proxy. Each is independently tried; only return on a real
+  //    parsed success. An empty 200 from one proxy will fall through to the
+  //    next, instead of being mistaken for a successful response.
   let lastErr = null;
   for (const buildProxyUrl of CONFIG.corsProxies) {
     const proxiedUrl = buildProxyUrl(targetUrl);
+    const proxyName  = new URL(proxiedUrl).hostname;
     try {
-      const res = await fetch(proxiedUrl, init);
-      if (res.ok) {
-        console.log('[skyward] proxy hit:', proxiedUrl.split('?')[0]);
-        return res;
-      }
-      lastErr = new Error(`proxy ${res.status}`);
-      console.warn('[skyward] proxy returned', res.status, 'via', proxiedUrl.split('?')[0]);
+      const result = await tryFetch(proxiedUrl, `proxy ${proxyName}`);
+      console.log('[skyward] proxy hit:', proxyName);
+      return result;
     } catch (e) {
       lastErr = e;
-      console.warn('[skyward] proxy threw', e.message, 'via', proxiedUrl.split('?')[0]);
+      console.warn('[skyward] proxy', proxyName, 'failed:', e.message);
     }
   }
   throw lastErr || new Error(`all fetch attempts failed for ${targetUrl}`);
@@ -570,13 +612,12 @@ async function corsFetch(targetUrl, options = {}) {
 async function fetchAircraftListByCallsign(callsign) {
   const url = `${CONFIG.adsbBase}/callsign/${encodeURIComponent(callsign)}`;
   console.log('[skyward] fetching aircraft for callsign', callsign);
-  const res = await corsFetch(url);
-  const data = await res.json();
+  const { data } = await corsFetch(url);
   const list = (data && data.ac) || [];
   console.log('[skyward] adsb.lol returned', list.length, 'aircraft for', callsign);
   if (!list.length) return [];
 
-  const withPos = list.filter(a => a.lat != null && a.lon != null);
+  const withPos = list.filter(a => validCoord(a.lat, a.lon));
   if (!withPos.length) return [];
 
   const target = callsign.trim().toUpperCase();
@@ -621,96 +662,133 @@ function pickBestAircraft(list, route) {
 }
 
 /* ─────────────────────────────────────────
-   API — route lookup
-   Primary: adsb.lol's own /api/0/routeset endpoint. This is the SAME source
-   adsb.lol's own website uses, so origin/destination will match what the
-   user sees there. It accepts the plane's current location and returns a
-   `plausible` boolean that flags route data that doesn't fit the actual
-   aircraft position — letting us reject stale matches before drawing them.
-   Fallbacks: adsbdb.com, then hexdb.io.
-   Returns { from, to } airport pair or null.
+   API — route lookup (verified multi-source)
+   We query adsb.lol, adsbdb, AND hexdb in parallel, then verify each route
+   against the aircraft's actual position. The route whose origin→destination
+   line passes nearest the plane wins. This way we get coverage (no more
+   "no route at all") AND correctness (no more wrong cities) at once.
+   Returns { from, to, source, score } or null.
    ───────────────────────────────────────── */
 async function fetchRouteByCallsign(callsign, lat = 0, lon = 0) {
   const cs = (callsign || '').trim();
   if (!cs) return null;
 
-  // ── PRIMARY: adsb.lol routeset.
-  // This is the same database adsb.lol's own website uses. Whatever it
-  // returns IS the canonical answer for "what does adsb.lol show for this
-  // flight." We use it unconditionally — even when plausible:false — because
-  // the website also displays it in those cases, and the user is comparing
-  // against the website. The plausible flag is logged for diagnostic purposes
-  // but does NOT gate display.
+  console.log('[skyward] looking up route for', cs, 'at', lat?.toFixed?.(2), lon?.toFixed?.(2));
+
+  // Run all three lookups concurrently — fastest path to coverage.
+  const results = await Promise.allSettled([
+    routeFromAdsblol(cs, lat, lon),
+    routeFromAdsbdb(cs),
+    routeFromHexdb(cs),
+  ]);
+
+  // Collect only the lookups that produced a usable route with valid coords.
+  const candidates = [];
+  for (const r of results) {
+    if (r.status === 'fulfilled' && r.value &&
+        validCoord(r.value.from.lat, r.value.from.lon) &&
+        validCoord(r.value.to.lat,   r.value.to.lon)) {
+      candidates.push(r.value);
+    }
+  }
+
+  if (!candidates.length) {
+    console.warn('[skyward] no source returned a route for', cs);
+    return null;
+  }
+
+  // No aircraft position to verify against → trust adsb.lol's order-of-listing.
+  if (!validCoord(lat, lon)) {
+    console.log('[skyward] no aircraft position — using first available source:', candidates[0].source);
+    return candidates[0];
+  }
+
+  // Score each candidate by how plausible it is given the actual position.
+  // Reuses scoreRouteConsistency by treating the position as a tiny aircraft.
+  const fakeAircraft = { lat, lon, track: null };
+  const scored = candidates.map(c => ({
+    route: c,
+    score: scoreRouteConsistency(fakeAircraft, c),
+  }));
+  scored.sort((a, b) => b.score - a.score);
+
+  for (const s of scored) {
+    console.log(`[skyward]   ${s.route.source}: ${s.route.from.iata}→${s.route.to.iata} (score ${s.score.toFixed(1)})`);
+  }
+
+  const winner = scored[0];
+  // If even the best candidate is wildly off the actual position, all sources
+  // are likely wrong — refuse to display rather than draw a bad line.
+  if (winner.score < 30) {
+    console.warn('[skyward] best route score', winner.score.toFixed(1), '— too inconsistent with position; suppressing');
+    return null;
+  }
+  console.log(`[skyward] ✓ chose ${winner.route.source}: ${winner.route.from.city || winner.route.from.iata} → ${winner.route.to.city || winner.route.to.iata}`);
+  return { ...winner.route, score: winner.score };
+}
+
+// ── Source 1: adsb.lol's /api/0/routeset (matches adsb.lol website) ──
+async function routeFromAdsblol(cs, lat, lon) {
   try {
     const url  = `${CONFIG.adsbBase.replace(/\/v2$/, '')}/api/0/routeset`;
     const body = JSON.stringify({ planes: [{ callsign: cs, lat, lng: lon }] });
-    console.log('[skyward] querying adsb.lol routeset:', cs, 'pos:', lat?.toFixed?.(2), lon?.toFixed?.(2));
-    const res  = await corsFetch(url, { method: 'POST', body });
-    const data = await res.json();
-    console.log('[skyward] adsb.lol routeset raw response:', JSON.stringify(data));
+    const { data } = await corsFetch(url, { method: 'POST', body });
     const entry = Array.isArray(data) ? data[0] : null;
-    if (entry && Array.isArray(entry._airports) && entry._airports.length >= 2) {
-      const origin = entry._airports[0];
-      const dest   = entry._airports[entry._airports.length - 1];
-      console.log(`[skyward] ✓ route from adsb.lol: ${origin.iata} (${origin.location}) → ${dest.iata} (${dest.location}) [plausible=${entry.plausible}]`);
-      return {
-        from:      airportFromAdsblol(origin),
-        to:        airportFromAdsblol(dest),
-        source:    'adsb.lol',
-        plausible: entry.plausible !== false,
-      };
-    }
-    console.log('[skyward] adsb.lol returned no airport data — trying fallbacks');
+    if (!entry || !Array.isArray(entry._airports) || entry._airports.length < 2) return null;
+    const origin = entry._airports[0];
+    const dest   = entry._airports[entry._airports.length - 1];
+    if (!validCoord(origin.lat, origin.lon) || !validCoord(dest.lat, dest.lon)) return null;
+    return {
+      from:   airportFromAdsblol(origin),
+      to:     airportFromAdsblol(dest),
+      source: 'adsb.lol',
+    };
   } catch (e) {
-    console.warn('[skyward] adsb.lol routeset failed:', e.message, '— trying fallbacks');
+    console.warn('[skyward] adsb.lol routeset failed:', e.message);
+    return null;
   }
+}
 
-  // ── FALLBACK 1: adsbdb.com (when adsb.lol returns nothing) ──
+// ── Source 2: adsbdb.com (open-source flight-route DB with airport coords) ──
+async function routeFromAdsbdb(cs) {
   try {
     const url  = `${CONFIG.adsbdbBase}/callsign/${encodeURIComponent(cs)}`;
-    const res  = await corsFetch(url);
-    const data = await res.json();
+    const { data } = await corsFetch(url);
     const fr   = data && data.response && data.response.flightroute;
-    if (fr && fr.origin && fr.destination &&
-        typeof fr.origin.latitude === 'number' && typeof fr.origin.longitude === 'number' &&
-        typeof fr.destination.latitude === 'number' && typeof fr.destination.longitude === 'number') {
-      console.log(`[skyward] ✓ route from adsbdb (fallback): ${fr.origin.iata_code} (${fr.origin.municipality}) → ${fr.destination.iata_code} (${fr.destination.municipality})`);
-      return {
-        from:   airportFromAdsbdb(fr.origin),
-        to:     airportFromAdsbdb(fr.destination),
-        source: 'adsbdb',
-      };
-    }
+    if (!fr || !fr.origin || !fr.destination) return null;
+    if (!Number.isFinite(fr.origin.latitude) || !Number.isFinite(fr.origin.longitude) ||
+        !Number.isFinite(fr.destination.latitude) || !Number.isFinite(fr.destination.longitude)) return null;
+    return {
+      from:   airportFromAdsbdb(fr.origin),
+      to:     airportFromAdsbdb(fr.destination),
+      source: 'adsbdb',
+    };
   } catch (e) {
     console.warn('[skyward] adsbdb route lookup failed:', e.message);
+    return null;
   }
+}
 
-  // ── FALLBACK 2: hexdb.io (last resort) ──
+// ── Source 3: hexdb.io (returns ICAO codes; airports come from local table) ──
+async function routeFromHexdb(cs) {
   try {
     const url  = `${CONFIG.hexdbBase}/route/icao/${encodeURIComponent(cs)}`;
-    const res  = await corsFetch(url);
-    const data = await res.json();
-    if (data && data.route) {
-      const parts = String(data.route).split('-').map(s => s.trim()).filter(Boolean);
-      if (parts.length >= 2) {
-        const fromAp = AIRPORTS[parts[0]];
-        const toAp   = AIRPORTS[parts[parts.length - 1]];
-        if (fromAp && toAp) {
-          console.log(`[skyward] ✓ route from hexdb (last-resort fallback): ${fromAp.iata} → ${toAp.iata}`);
-          return {
-            from:   { ...fromAp, icao: parts[0] },
-            to:     { ...toAp,   icao: parts[parts.length - 1] },
-            source: 'hexdb',
-          };
-        }
-      }
-    }
+    const { data } = await corsFetch(url);
+    if (!data || !data.route) return null;
+    const parts  = String(data.route).split('-').map(s => s.trim()).filter(Boolean);
+    if (parts.length < 2) return null;
+    const fromAp = AIRPORTS[parts[0]];
+    const toAp   = AIRPORTS[parts[parts.length - 1]];
+    if (!fromAp || !toAp) return null;
+    return {
+      from:   { ...fromAp, icao: parts[0] },
+      to:     { ...toAp,   icao: parts[parts.length - 1] },
+      source: 'hexdb',
+    };
   } catch (e) {
     console.warn('[skyward] hexdb route lookup failed:', e.message);
+    return null;
   }
-
-  console.warn('[skyward] no route data available for', cs, 'from any source');
-  return null;
 }
 
 // Normalize an adsb.lol routeset airport entry into our standard airport shape
@@ -792,6 +870,13 @@ function planeIcon(headingDeg) {
    Render: route, plane, stats
    ───────────────────────────────────────── */
 function renderRoute(from, to, timing) {
+  if (!from || !to ||
+      !validCoord(from.lat, from.lon) ||
+      !validCoord(to.lat,   to.lon)) {
+    console.warn('[skyward] renderRoute called with invalid coordinates — skipping');
+    return;
+  }
+
   const path = greatCirclePath(from.lat, from.lon, to.lat, to.lon, 128);
   state.routeLayer = L.polyline(path, {
     color: '#e9b872', weight: 2, opacity: 0.55,
@@ -855,6 +940,7 @@ function renderFlownPath(from, currentLat, currentLon) {
 }
 
 function renderPlane(lat, lon, heading) {
+  if (!validCoord(lat, lon)) return;
   if (state.planeMarker) {
     state.planeMarker.setLatLng([lat, lon]);
     state.planeMarker.setIcon(planeIcon(heading));
@@ -867,11 +953,11 @@ function renderPlane(lat, lon, heading) {
 
 function fitMapToFlight(from, to, planeLat, planeLon) {
   const points = [];
-  if (from) points.push([from.lat, from.lon]);
-  if (to)   points.push([to.lat, to.lon]);
-  if (planeLat != null && planeLon != null) points.push([planeLat, planeLon]);
-  if (points.length === 1) state.map.setView(points[0], 6);
-  else if (points.length > 1) state.map.fitBounds(points, { padding: [60, 60], maxZoom: 7 });
+  if (from && validCoord(from.lat, from.lon)) points.push([from.lat, from.lon]);
+  if (to   && validCoord(to.lat,   to.lon))   points.push([to.lat,   to.lon]);
+  if (validCoord(planeLat, planeLon))         points.push([planeLat, planeLon]);
+  if (points.length === 1)      state.map.setView(points[0], 6);
+  else if (points.length > 1)   state.map.fitBounds(points, { padding: [60, 60], maxZoom: 7 });
 }
 
 /** Estimate departure & arrival times from current speed and progress.
@@ -916,8 +1002,7 @@ async function fetchDestinationWeather(lat, lon) {
     wind_speed_unit:    'mph',
   });
   const url = `${CONFIG.weatherBase}?${params}`;
-  const res = await corsFetch(url);
-  const data = await res.json();
+  const { data } = await corsFetch(url);
   return data.current || null;
 }
 
@@ -1340,17 +1425,10 @@ async function trackFlight(rawInput) {
     aircraft = pickBestAircraft(aircraftList, route);
   }
 
-  // Step 5: validation. ONLY validate fallback sources (adsbdb / hexdb) with
-  // position scoring — adsb.lol is canonical and is shown unconditionally.
-  let confirmedRoute = route;
-  if (route && route.source && route.source !== 'adsb.lol') {
-    const score = scoreRouteConsistency(aircraft, route);
-    if (score < 30) {
-      console.warn(`[skyward] fallback route from ${route.source} scored ${score.toFixed(1)} — suppressing as inconsistent with position`);
-      confirmedRoute = null;
-    }
-  }
-  state.currentRoute    = confirmedRoute;
+  // Step 5: route is already verified inside fetchRouteByCallsign (which
+  // queries multiple sources and picks the one most consistent with the
+  // aircraft's actual position). Just commit it to state.
+  state.currentRoute    = route;
   state.currentCallsign = (aircraft.flight || usedCallsign || '').trim();
   state.currentIcao24   = aircraft.hex;
 
@@ -1378,7 +1456,11 @@ async function trackFlight(rawInput) {
   // Pull weather + transport for the destination once now, then on a slow
   // 10-minute cadence (Open-Meteo updates roughly every 15 min anyway).
   refreshArrivalCard();
-  state.weatherTimer = setInterval(refreshArrivalCard, CONFIG.weatherRefreshMs);
+  state.weatherTimer = setInterval(() => {
+    refreshArrivalCard().catch(err => {
+      console.warn('[skyward] weather refresh tick threw — recovering:', err);
+    });
+  }, CONFIG.weatherRefreshMs);
 }
 
 /* ─────────────────────────────────────────
@@ -1451,24 +1533,42 @@ function renderFromFix() {
  *  the path's bearing at that point so the plane icon can be oriented along
  *  the line rather than at its raw heading. */
 function snapToRoute(route, lat, lon) {
+  if (!route || !route.from || !route.to) return null;
+  if (!validCoord(route.from.lat, route.from.lon) ||
+      !validCoord(route.to.lat,   route.to.lon)   ||
+      !validCoord(lat, lon)) return null;
+
   const totalKm = haversineKm(route.from.lat, route.from.lon, route.to.lat, route.to.lon);
-  if (totalKm <= 0) return null;
+  if (!totalKm || totalKm <= 0) return null;
   const flownKm = haversineKm(route.from.lat, route.from.lon, lat, lon);
   const ratio   = Math.min(1, Math.max(0, flownKm / totalKm));
+  if (!Number.isFinite(ratio)) return null;
 
   const path = greatCirclePath(route.from.lat, route.from.lon,
                                route.to.lat,   route.to.lon, 256);
-  const idx   = Math.min(path.length - 1, Math.floor(ratio * (path.length - 1)));
+  if (!path.length) return null;
+  const idx   = Math.min(path.length - 1, Math.max(0, Math.floor(ratio * (path.length - 1))));
   const here  = path[idx];
   const next  = path[Math.min(idx + 1, path.length - 1)];
+  if (!here || !validCoord(here[0], here[1])) return null;
 
-  const bearing = (here !== next) ? bearingDeg(here[0], here[1], next[0], next[1]) : null;
+  const bearing = (here !== next && next && validCoord(next[0], next[1]))
+    ? bearingDeg(here[0], here[1], next[0], next[1])
+    : null;
   return { lat: here[0], lon: here[1], bearing };
 }
 
 function startAnimation() {
   stopAnimation();
-  state.animationTimer = setInterval(renderFromFix, 1000);
+  // Wrap the tick so a thrown exception in one frame can't poison the
+  // setInterval and freeze the live update forever.
+  state.animationTimer = setInterval(() => {
+    try {
+      renderFromFix();
+    } catch (err) {
+      console.warn('[skyward] render tick threw — recovering:', err);
+    }
+  }, 1000);
 }
 function stopAnimation() {
   if (state.animationTimer) {
