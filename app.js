@@ -28,7 +28,7 @@ const CONFIG = {
   refreshMs:        30_000,                // re-poll live position every 30s
   weatherRefreshMs: 10 * 60_000,           // weather every 10 min
   storageKey:  'skyward.v2',
-  partnerName: 'Norma',
+  partnerName: 'You',
 };
 
 /* ─────────────────────────────────────────
